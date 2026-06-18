@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# --- Node / Electron desktop ---
+desktop/node_modules/
+desktop/dist/
+desktop/dist-electron/
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# --- Secrets / local config ---
+.env
+.env.*
+providers.toml          # local provider keys; commit providers.example.toml instead
+
+# --- Runtime data (regenerated; never source) ---
+# The file-based project store: source media, transcripts, EDLs, renders, frames, mattes.
+projects/
+# OBS capture output (separate screen + camera files).
+recordings/
+
+# Stray media that lands at the repo root during ad-hoc runs.
+/*.mp4
+/*.mkv
+/*.wav
+/*.png
+
+# --- Editor / OS noise ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
