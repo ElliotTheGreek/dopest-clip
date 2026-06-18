@@ -181,8 +181,12 @@ def _normalize_shots(shots, default_zoom):
     return norm or [{"start": 0.0, "mode": "full", "zoom": default_zoom, "x": None, "y": None, "crop": None}]
 
 
-def _detect_center(model, frame, conf):
-    res = model(frame, classes=[0], conf=conf, verbose=False, device=0)
+def _detect_center(model, frame, conf, classes=None, center_frac=0.33):
+    """Largest detection's centre. classes=None -> [0] (person); center_frac biases the
+    y toward the top of the box (0.33 ~ head for a person; pass 0.5 for object centre).
+    Returns (cx, cy) or None. (Used by reframe's subject track AND by obs.tracking.)"""
+    cls = [0] if classes is None else classes
+    res = model(frame, classes=cls, conf=conf, verbose=False, device=0)
     best = None
     for r in res:
         if r.boxes is None:
@@ -191,8 +195,25 @@ def _detect_center(model, frame, conf):
             x1, y1, x2, y2 = (float(v) for v in b.xyxy[0].tolist())
             area = (x2 - x1) * (y2 - y1)
             if best is None or area > best[2]:
-                best = ((x1 + x2) / 2, y1 + (y2 - y1) * 0.33, area)
+                best = ((x1 + x2) / 2, y1 + (y2 - y1) * center_frac, area, x2 - x1, y2 - y1)
     return (best[0], best[1]) if best else None
+
+
+def _detect_box(model, frame, conf, classes, center_frac=0.5):
+    """Like _detect_center but also returns the box size: (cx, cy, w, h) or None.
+    Used by obs.tracking to size a ring/zoom to the tracked object."""
+    cls = classes if classes else [0]
+    res = model(frame, classes=cls, conf=conf, verbose=False, device=0)
+    best = None
+    for r in res:
+        if r.boxes is None:
+            continue
+        for b in r.boxes:
+            x1, y1, x2, y2 = (float(v) for v in b.xyxy[0].tolist())
+            area = (x2 - x1) * (y2 - y1)
+            if best is None or area > best[2]:
+                best = ((x1 + x2) / 2, y1 + (y2 - y1) * center_frac, area, x2 - x1, y2 - y1)
+    return (best[0], best[1], best[3], best[4]) if best else None
 
 
 def _apply_censor(frame, regions, t):

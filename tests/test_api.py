@@ -129,6 +129,27 @@ def test_list_graphics_catalog_shape():
     assert set(g["kinds"]) == {"arrow", "ring", "box", "label"} and "custom" in g
 
 
+def test_preview_track_explicit_video_path_delegates(monkeypatch):
+    from dopest_clip.obs import tracking as trk
+    cap = _spy(monkeypatch, trk, "preview", {"ok": "track"})
+    out = api.preview_track("p", "cursor", video_path="C:/v.mp4", at=1.5)
+    assert out == {"ok": "track"}
+    assert cap["args"][0] == "C:/v.mp4" and cap["args"][1] == "cursor"
+    assert cap["kwargs"]["at"] == 1.5
+
+
+def test_preview_track_resolves_screen_and_camera_paths(monkeypatch, tmp_path):
+    from dopest_clip import project
+    from dopest_clip.obs import tracking as trk
+    monkeypatch.setattr(project, "require_project", lambda pid: tmp_path)
+    monkeypatch.setattr(project, "slugify", lambda e: "demo")
+    cap = _spy(monkeypatch, trk, "preview", {"ok": "track"})
+    api.preview_track("p", "face", edl_id="demo", source="screen")
+    assert cap["args"][0] == str(tmp_path / "renders" / "demo.mp4")
+    api.preview_track("p", "face", edl_id="demo", source="camera")
+    assert cap["args"][0] == str(tmp_path / "camera" / "demo_cut.mp4")
+
+
 # --- jobs (async render control) ------------------------------------------------------
 
 def test_render_status_and_list_via_api():

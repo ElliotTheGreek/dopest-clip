@@ -23,10 +23,38 @@ import tempfile
 from typing import Any
 
 from .. import config, edl as edlmod, project
-from . import timeline
+from . import timeline, tracking
 
 _RVM = None
 _NVENC = None
+
+
+def _split_track(param):
+    """Pull an optional `track` spec out of a keyframe param so the effect can FOLLOW a
+    target. The track may ride two ways (both keep the MCP schema a plain keyframe list):
+      - on any keyframe dict:  [{t, zoom, focus, track:{target,source}}, ...]
+      - as a wrapper dict:     {keyframes:[...], track:{target,source}}
+    Returns (clean_keyframes_list, track_spec_or_None); the `track` key is stripped from the
+    keyframes so the timeline normalizers never see it."""
+    if isinstance(param, dict) and "keyframes" in param:
+        return param["keyframes"], param.get("track")
+    if isinstance(param, list):
+        track = None
+        clean = []
+        for kf in param:
+            if isinstance(kf, dict) and "track" in kf:
+                k = dict(kf)
+                track = k.pop("track") or track
+                clean.append(k)
+            else:
+                clean.append(kf)
+        return clean, track
+    return param, None
+
+
+def _compute_track(track_spec, screen_path, cam_path, cache_dir):
+    """Thin alias for tracking.resolve_track (the shared GPU/CPU track resolver)."""
+    return tracking.resolve_track(track_spec, screen_path, cam_path, cache_dir)
 
 
 def _nvenc_ok() -> bool:
@@ -191,12 +219,15 @@ def _blur_gpu(img_hw3, strength: float):
         small, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
 
 
-def _screen_zoom_gpu(screen_hw3, skfs, t: float, sw: int, sh: int):
-    """Crop+zoom an HxWx3 screen tensor per normalized screen keyframes; same size out."""
+def _screen_zoom_gpu(screen_hw3, skfs, t: float, sw: int, sh: int, track=None):
+    """Crop+zoom an HxWx3 screen tensor per normalized screen keyframes; same size out. When
+    `track` is given the crop keeps its zoom level but rides the tracked point (clamped)."""
     if not skfs:
         return screen_hw3
     import torch
     cx, cy, cw, ch = timeline.sample_screen(skfs, t, sw, sh)
+    if track:
+        cx, cy, cw, ch = tracking.apply_track_to_rect((cx, cy, cw, ch), track, t, sw, sh, clamp=True)
     crop = screen_hw3[cy:cy + ch, cx:cx + cw, :].permute(2, 0, 1).unsqueeze(0)
     return torch.nn.functional.interpolate(
         crop, size=(sh, sw), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
@@ -217,6 +248,8 @@ def _apply_blurs_gpu(screen_hw3, blur_specs, t: float, fw: int, fh: int, duratio
         if blurred is None:
             blurred = _blur_gpu(screen_hw3, float(s.get("strength", 18)))
         rect = timeline.sample_overlay(s["_kfs"], t, fw, fh, float(s.get("aspect", 1.0)), [0.5, 0.5])
+        if s.get("_track"):
+            rect = tracking.apply_track_to_rect(rect, s["_track"], t, fw, fh)
         m = blurmod._mask(s, rect, fw, fh) * amp  # HxW float numpy
         mt = torch.from_numpy(m).to(screen_hw3.device).float().unsqueeze(-1)
         screen_hw3 = screen_hw3 * (1 - mt) + blurred * mt
@@ -226,9 +259,11 @@ def _apply_blurs_gpu(screen_hw3, blur_specs, t: float, fw: int, fh: int, duratio
     return screen_hw3
 
 
-def _prep_overlays(overlays, fw: int):
+def _prep_overlays(overlays, fw: int, screen_path=None, cam_path=None, cache_dir=None):
     """Pre-rasterize each overlay to an RGBA numpy array ONCE (svg/kind via resvg, or a
-    transparent PNG via image). Returns prepared dicts for per-frame compositing."""
+    transparent PNG via image). If an overlay carries a `track` spec, its per-frame track is
+    computed ONCE here (cached) and stored so the overlay rides the target. Returns prepared
+    dicts for per-frame compositing."""
     if not overlays:
         return []
     from . import graphics
@@ -246,7 +281,8 @@ def _prep_overlays(overlays, fw: int):
         oh, ow = arr.shape[0], arr.shape[1]
         out.append({"arr": arr, "anchor": anchor, "kfs": kfs, "aspect": ow / oh,
                     "t_in": float(spec.get("t_in", kfs[0]["t"])), "t_out": spec.get("t_out"),
-                    "fade": float(spec.get("fade", 0.3)), "opacity": float(spec.get("opacity", 1.0))})
+                    "fade": float(spec.get("fade", 0.3)), "opacity": float(spec.get("opacity", 1.0)),
+                    "track": _compute_track(spec.get("track"), screen_path, cam_path, cache_dir)})
     return out
 
 
@@ -267,6 +303,9 @@ def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duratio
         if amp <= 0:
             continue
         x, y, w, h = timeline.sample_overlay(o["kfs"], t, fw, fh, o["aspect"], o["anchor"])
+        if o.get("track"):
+            x, y, w, h = tracking.apply_track_to_rect((x, y, w, h), o["track"], t, fw, fh,
+                                                      anchor=o["anchor"])
         if w < 1 or h < 1:
             continue
         rgba = torch.from_numpy(o["arr"]).to(canvas_hw3.device).float().permute(2, 0, 1).unsqueeze(0)
@@ -308,15 +347,22 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
     cw = int(cap_f.get(cv2.CAP_PROP_FRAME_WIDTH))
     ch = int(cap_f.get(cv2.CAP_PROP_FRAME_HEIGHT))
     aspect = cw / ch
-    kfs = timeline.normalize_keyframes(keyframes)
-    skfs = timeline.normalize_screen_keyframes(screen_keyframes or [])
+    cache_dir = os.path.dirname(os.path.abspath(out_path))
+    # camera + screen-zoom params may arrive as {keyframes, track} to FOLLOW a target.
+    kf_list, cam_track_spec = _split_track(keyframes)
+    skf_list, screen_track_spec = _split_track(screen_keyframes or [])
+    kfs = timeline.normalize_keyframes(kf_list)
+    skfs = timeline.normalize_screen_keyframes(skf_list)
+    cam_track = _compute_track(cam_track_spec, screen_path, cut_cam_path, cache_dir)
+    screen_track = _compute_track(screen_track_spec, screen_path, cut_cam_path, cache_dir)
     blur_specs = []
     for s in (blurs or []):
         s2 = dict(s)
         s2["_kfs"] = timeline.normalize_overlay_keyframes(s["keyframes"])
+        s2["_track"] = _compute_track(s.get("track"), screen_path, cut_cam_path, cache_dir)
         blur_specs.append(s2)
-    prepped = _prep_overlays(overlays, fw)
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    prepped = _prep_overlays(overlays, fw, screen_path=screen_path, cam_path=cut_cam_path, cache_dir=cache_dir)
+    os.makedirs(cache_dir, exist_ok=True)
 
     proc = subprocess.Popen(
         [config.FFMPEG, "-y", "-loglevel", "error",
@@ -348,10 +394,12 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                 idx += 1
                 screen = torch.from_numpy(cv2.cvtColor(s, cv2.COLOR_BGR2RGB)).to(dev).float()
                 if skfs:
-                    screen = _screen_zoom_gpu(screen, skfs, t, fw, fh)
+                    screen = _screen_zoom_gpu(screen, skfs, t, fw, fh, track=screen_track)
                 if blur_specs:
                     screen = _apply_blurs_gpu(screen, blur_specs, t, fw, fh, duration)
                 x, y, w, h = timeline.sample(kfs, t, fw, fh, aspect)
+                if cam_track:
+                    x, y, w, h = tracking.apply_track_to_rect((x, y, w, h), cam_track, t, fw, fh)
                 x0, y0 = max(0, x), max(0, y)
                 x1, y1 = min(fw, x + w), min(fh, y + h)
                 bg_visible = (bg_visible_until is not None) and (t < float(bg_visible_until))
@@ -590,13 +638,17 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass)
-    skfs = timeline.normalize_screen_keyframes(screen_keyframes or [])
+    skf_list, screen_track_spec = _split_track(screen_keyframes or [])
+    skfs = timeline.normalize_screen_keyframes(skf_list)
 
     tmp = tempfile.mkdtemp()
     cs, cf, cp = os.path.join(tmp, "s.mp4"), os.path.join(tmp, "f.mp4"), os.path.join(tmp, "p.mp4")
     _trim(screen_cut, t0, dur, cs, audio=True)
     _trim(fgr, t0, dur, cf)
     _trim(pha, t0, dur, cp)
+    # tracks for a short are computed on the TRIMMED clip (normalized to its own frame).
+    cache_dir = os.path.dirname(os.path.abspath(out_path))
+    screen_track = _compute_track(screen_track_spec, cs, cf, cache_dir)
 
     cap_s, cap_f, cap_p = cv2.VideoCapture(cs), cv2.VideoCapture(cf), cv2.VideoCapture(cp)
     fps = cap_s.get(cv2.CAP_PROP_FPS) or 30.0
@@ -605,7 +657,7 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
     CW, CH = 1080, 1920
     disp_w, disp_h = 1080, int(round(1080 * sh / sw))   # screen display zone (e.g. 1080x607)
     pw = int(round(pfw * person_h / pfh))               # person scaled to person_h tall
-    prepped = _prep_overlays(overlays, CW)              # graphics on top of the 9:16 stack
+    prepped = _prep_overlays(overlays, CW, screen_path=cs, cam_path=cf, cache_dir=cache_dir)
 
     sub = (f"subtitles=filename='{media.escape_filter_path(ass_path)}'"
            f":fontsdir='{media.escape_filter_path(str(captions.FONTS_DIR))}'")
@@ -640,6 +692,8 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
                 canvas = bg.clone()
                 # middle: zoomed screen crop -> display zone
                 cx, cy, cw, ch = timeline.sample_screen(skfs, t, sw, sh)
+                if screen_track:
+                    cx, cy, cw, ch = tracking.apply_track_to_rect((cx, cy, cw, ch), screen_track, t, sw, sh, clamp=True)
                 crop = screen[cy:cy + ch, cx:cx + cw, :].permute(2, 0, 1).unsqueeze(0)
                 disp = torch.nn.functional.interpolate(crop, size=(disp_h, disp_w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
                 canvas[screen_top_y:screen_top_y + disp_h, 0:disp_w, :] = disp

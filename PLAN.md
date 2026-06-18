@@ -80,6 +80,78 @@ overlays in `compose_camera`, never both; CPU `compose_camera` on a 4-min clip i
 - Both added near the top of the README. Unit tests for every new GPU-compose path.
 - Screen-zoom-into-the-record-button in LONG-form is delivered by Task 1's screen-zoom-over-cut.
 
+### STATUS — DONE (2026-06-18, verified on demo1)
+Unified GPU compose-over-cut shipped: `composite_gpu` now does screen-zoom + animated blur/focus +
+graphic overlays + mid-clip background toggle in one NVENC pass; `mix_camera`/`make_short` expose
+`overlays`/`blurs`/`screen_keyframes`/`bg_visible_until`. Long renders run async over MCP via
+`start_render`/`render_status` (no synchronous timeout). MCP control surface (api/server/sidecar/
+jobs/__main__) at **100% coverage**. demo1 cut to landscape (16:9, all effects) + portrait (9:16);
+every requested feature frame-verified.
+
+---
+
+## NEXT LEG — dynamic tracking (follow faces, the mouse, called-out objects) (2026-06-18)
+
+**Where we stand:** subject/face tracking ALREADY exists at parity — `reframe.py` `track` mode
+(YOLO11 `_load_model`/`_detect_center` + `_OneEuro` smoothing) follows the person for a portrait
+crop, via `render(reframe={mode:"track", aspect:...})`. That matches the old combo.
+
+**The extension (new, not in the old combo):** make ANY effect *follow a moving target* instead of
+sitting at static keyframes — so a screen-zoom rides the mouse, an arrow stays glued to a button as
+the page scrolls, the face-ring auto-tracks the face, etc. The missing piece is a per-frame
+**tracking position source** feeding the effect position.
+
+### Tasks
+1. **Tracking module** (`dopest_clip/obs/tracking.py`): `compute_track(video, target, fps) ->
+   [{t, x, y, w, h}]` (normalized), smoothed with `reframe._OneEuro` (reuse). Targets:
+   - `"cursor"` — detect the OS cursor baked into the screen capture (template-match a shipped
+     cursor sprite asset + small-fast-moving fallback). Source = the screen video.
+   - `{template_at: t, region: [x,y,w,h]}` — seed an OpenCV tracker (CSRT) from that region and
+     follow it across frames (handles scroll/move). Source = screen or camera.
+   - `"face"` — face detector (OpenCV DNN/haar or YOLO-face) on the CAMERA frames.
+   - `"<yolo-class>"` (person/cup/laptop/…) — reuse `reframe._load_model` (YOLO11) on the camera.
+2. **`track` field on effect specs** (overlay / blur / screen_keyframes / camera keyframes):
+   `track: {target, source:"screen"|"camera"}`. When present, the compositor resolves the per-frame
+   position from a PRE-COMPUTED track (run detection once before the GPU frame loop, index by frame)
+   instead of `timeline.sample_*` static keyframes. Wire into `camera_mix.composite_gpu` +
+   `vertical_clip` (+ CPU `compositor.compose`).
+3. **Surface**: the `track` field rides inside the existing `overlays`/`blurs`/`screen_keyframes`
+   dicts — no new required params. Add a `preview_track(project_id, video, target)` op (returns the
+   track + a sample frame) so the agent can sanity-check a target before a full render. Document in
+   `learn://reframe` + `learn://recording`.
+4. **Tests**: keep MCP-control coverage at 100%; unit-test the track-vs-static position selection,
+   `_OneEuro` smoothing of a synthetic track, and spec plumbing (detectors themselves marked
+   needs_gpu/needs_cv and exercised live). 
+5. **Verify on demo1**: a screen-zoom that follows the cursor through the record→render-cut moment;
+   an arrow glued to the "record" button; the face-ring tracking the face.
+
+### Reuse (do not rewrite)
+`reframe._OneEuro`, `reframe._load_model` + `reframe._detect_center` (YOLO), `timeline.sample_*`
+(static fallback), `grab_frame` (seed templates), `_prep_overlays`/`_paste_overlays_gpu` (compose).
+
+### STATUS — IMPLEMENTED (2026-06-18, code-complete; live verify pending a server restart)
+1. **`dopest_clip/obs/tracking.py`** — DONE. `compute_track(video, target, every=, cache_path=)`
+   → dense per-frame normalized `[{t,x,y,w,h}]`, smoothed via `reframe._smooth_centers` (reuses
+   `_OneEuro`). Detectors: `"cursor"` (cv2 matchTemplate vs `assets/cursor.png`), `"face"` (haar
+   cascade), COCO class (`reframe._load_model` + new `reframe._detect_box`, sizes the box),
+   `{template_at, region}` (per-frame matchTemplate of the seed crop — robust + always available;
+   CSRT noted as a future option). `sample_track`, `apply_track_to_rect` (pure recentre, keeps
+   size), `resolve_track` (shared GPU/CPU resolver, cached under `<project>/camera/`), `preview`.
+2. **`track` field** — DONE. Rides inside an overlay/blur spec OR on a screen_keyframe/camera
+   keyframe (lifted by `camera_mix._split_track`, stripped before normalize). Wired through
+   `camera_mix.composite_gpu` + `vertical_clip` (screen-zoom, blur, overlays, camera rect) AND the
+   CPU `compositor.compose`/`_build_overlay`. Static keyframes set SIZE; the track sets POSITION.
+3. **Surface** — DONE. `preview_track(project_id, target, edl_id=, source=, video_path=, at=)`
+   registered (55 ops now). Documented in `learn://recording` (Dynamic tracking) + `learn://reframe`.
+4. **Tests** — DONE. MCP control surface still **100%** (api 140/140, server/sidecar/jobs/__main__).
+   `tests/test_tracking.py` covers the pure logic + cursor/face/template/yolo detector wiring at
+   96% (the 7 misses are defensive weak-match guards + the real-face-found branch, exercised live).
+   283 passed / 6 skipped.
+5. **Verify on demo1** — PENDING (needs the server restart so the new MCP code loads): preview_track
+   for cursor/face/template, then re-render landscape with cursor-follow zoom + button-glued arrow +
+   face-follow ring. Also still TODO: create `assets/cursor.png` (crop the OS pointer from a demo1
+   grab_frame) — until then cursor tracking raises a clear "crop one" error.
+
 > Earlier v2 polish (deferred, not parity): native file-picker, graphical keyframe-curve editor UI,
 > audio/image editor panels, FlowDot provider endpoint specifics.
 

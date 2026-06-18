@@ -232,7 +232,11 @@ def mix_camera(project_id: str, edl_id: str, camera_path: str, keyframes: list[d
     hand) with keyframes + t_in/t_out/fade; `blurs` are animated screen blur/focus regions
     (`invert:true` = blur everything BUT the shape = "blur all but my face"); `screen_keyframes`
     crop+zoom the screen over time (zoom into a button); `bg_visible_until` keeps the FULL camera
-    background visible until that second, then drops to the cutout."""
+    background visible until that second, then drops to the cutout. Any effect can FOLLOW a moving
+    target: add `track:{target, source}` inside an overlay/blur spec, or on a screen_keyframe/keyframe
+    (target = 'cursor' | 'face' | a COCO class | {template_at, region}; source 'screen'|'camera').
+    The static keyframes still set HOW BIG the effect is; the track sets WHERE it sits. Use
+    preview_track first to confirm the target locks on."""
     from .obs import camera_mix
     return camera_mix.mix(project_id, edl_id, camera_path, keyframes=keyframes,
                           remove_background=remove_background, output_path=output_path,
@@ -270,6 +274,26 @@ def make_short(project_id: str, edl_id: str, from_word: int, to_word: int, hook_
     return camera_mix.short_clip(project_id, edl_id, from_word, to_word, hook_title,
                                  screen_keyframes=screen_keyframes, caption_preset=caption_preset,
                                  output_path=output_path, overlays=overlays)
+
+
+def preview_track(project_id: str, target: str | dict, edl_id: str = "", source: str = "screen",
+                  video_path: str = "", at: float | None = None) -> dict:
+    """Confirm a tracking target locks on BEFORE a full render. Runs the detector over the
+    source video and returns a downsampled per-frame track plus a preview frame (at `at`
+    seconds, default midpoint) with the tracked point drawn. Source: 'screen' = the cut
+    render <project>/renders/<edl>.mp4, 'camera' = the cut camera <project>/camera/<edl>_cut.mp4,
+    or pass an explicit `video_path`. `target` is 'cursor' | 'face' | a COCO class name
+    (person/cup/laptop/phone/...) | {'template_at': seconds, 'region': [x,y,w,h]} to follow a
+    UI element. The same `track:{target, source}` field then rides inside the overlays / blurs /
+    screen_keyframes / keyframes of mix_camera / make_short to make that effect follow the target."""
+    from .obs import tracking
+    if not video_path:
+        from . import project
+        pdir = project.require_project(project_id)
+        slug = project.slugify(edl_id)
+        video_path = str((pdir / "camera" / f"{slug}_cut.mp4") if source == "camera"
+                         else (pdir / "renders" / f"{slug}.mp4"))
+    return tracking.preview(video_path, target, at=at)
 
 
 def list_graphics() -> dict:
@@ -342,7 +366,7 @@ GROUPS: dict[str, list] = {
     "providers": [list_providers, set_provider, validate_provider],
     "recording": [list_devices, setup_scene, start_recording, stop_recording,
                   recording_status, compose_camera, mix_camera, get_cut_transcript,
-                  make_short, list_graphics],
+                  make_short, list_graphics, preview_track],
     "jobs": [start_render, render_status, list_render_jobs],
 }
 

@@ -103,6 +103,24 @@ Place it over the head by putting pos just ABOVE the camera rect — e.g. camera
 PIP at scale 0.3 → head ≈ [0.83, 0.71], so the bulb sits at ≈ [0.83, 0.59]. ALWAYS grab a
 frame at the pop time to check placement and nudge. (Transparent PNG recipe: learn://image.)
 
+## Dynamic tracking — make any effect FOLLOW a moving target
+Every effect above sits at static keyframes. To make one RIDE a moving target instead, add a
+`track` field; the keyframes still set HOW BIG the effect is, the track sets WHERE it sits:
+- `track: {target, source}` rides INSIDE an overlay or blur spec, or on a screen_keyframe /
+  camera keyframe (e.g. `screen_keyframes=[{t:0, zoom:2, track:{target:"cursor"}}]`).
+- target = `"cursor"` (the OS pointer, matched on the screen), `"face"` (the camera face),
+  a COCO class (`"person"`,`"cup"`,`"laptop"`,`"cell phone"`,…), or `{"template_at": seconds,
+  "region": [x,y,w,h]}` to lock onto a UI element (a button) and follow it as the page scrolls.
+- source = `"screen"` (default; tracks the cut screen) or `"camera"` (tracks the cut camera —
+  use for `"face"`). A screen-zoom that rides the cursor, an arrow glued to a button, a ring
+  that tracks the face: same `track` field, different target.
+- preview_track(project_id, edl_id, target, source=…) FIRST — it runs the detector and returns
+  a downsampled track + a frame with the tracked point drawn, so you confirm the lock before a
+  full render. The track is cached per (video, target) under <project>/camera/.
+- Cursor tracking needs assets/cursor.png (a crop of the OS pointer); if absent it raises a
+  clear error telling you to grab+crop one. Detectors run on cv2 (cursor/face/template) or GPU
+  YOLO (COCO classes); the rest of the GPU compose pass is unchanged.
+
 ## Connection (env)
 OBS_WS_HOST (localhost), OBS_WS_PORT (4455), OBS_WS_PASSWORD, OBS_SCENE_NAME, OBS_CAMERA_DIR.
 
@@ -162,6 +180,13 @@ Aspects: 9:16, 4:5, 1:1, 16:9, source. A shot timeline switches modes across the
     reframe={aspect, transition_s, shots:[{start, mode, zoom?}, ...]}  (OUTPUT seconds)
 Use grab_frame to SEE the footage and preview_reframe to SEE the composited output
 before a full render. Needs the [reframe] extra (ultralytics + opencv) + a GPU helps.
+
+## Tracking effects (not just the portrait crop)
+The same subject-following that drives the portrait crop is also exposed to the COMPOSE
+effects so any overlay / blur / screen-zoom / camera rect can FOLLOW a target (the cursor,
+the face, a COCO object, or a UI element) instead of static keyframes. See learn://recording
+"Dynamic tracking": add `track:{target, source}` to an effect spec and confirm with
+preview_track before rendering.
 """
 
 RESOURCES["learn://captions"] = """\

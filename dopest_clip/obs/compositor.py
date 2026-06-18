@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from . import graphics, timeline
+from . import graphics, timeline, tracking
 
 
 def compose(
@@ -79,7 +79,13 @@ def compose(
     )
 
     layers = [screen, cam_layer]
-    overlay_clips = [_build_overlay(o, fw, fh, duration) for o in (overlays or [])]
+    # An overlay carrying a `track` spec follows the target instead of its static keyframes.
+    cache_dir = os.path.dirname(os.path.abspath(output_path))
+    overlay_clips = [
+        _build_overlay(o, fw, fh, duration,
+                       track=tracking.resolve_track(o.get("track"), screen_path, camera_path, cache_dir))
+        for o in (overlays or [])
+    ]
     layers.extend(overlay_clips)  # overlays render on top of the camera
 
     final = CompositeVideoClip(layers, size=(fw, fh)).with_duration(duration)
@@ -116,7 +122,7 @@ def _load_rgba(path: str):  # type: ignore[no-untyped-def]
     return np.array(Image.open(path).convert("RGBA"))
 
 
-def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float):  # type: ignore[no-untyped-def]
+def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float, track=None):  # type: ignore[no-untyped-def]
     """Build one animated overlay layer.
 
     spec source (one of):
@@ -147,7 +153,10 @@ def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float):  # 
     base = ImageClip(arr[:, :, :3]).with_mask(ImageClip(arr[:, :, 3] / 255.0, is_mask=True))
 
     def r(local_t: float) -> tuple[int, int, int, int]:
-        return timeline.sample_overlay(kfs, t_in + local_t, fw, fh, aspect, anchor)
+        rect = timeline.sample_overlay(kfs, t_in + local_t, fw, fh, aspect, anchor)
+        if track:
+            rect = tracking.apply_track_to_rect(rect, track, t_in + local_t, fw, fh, anchor=anchor)
+        return rect
 
     layer = (
         base.with_start(t_in).with_duration(t_out - t_in)
