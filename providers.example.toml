@@ -1,0 +1,27 @@
+# dopest-clip provider configuration (copy to providers.toml).
+#
+# Selects the active provider per capability. This is just PREFERENCE — a provider is
+# only an error when you actually USE it without a configured API key. Set keys via env
+# vars (below), not here; this file holds selection only.
+#
+# Resolution order for the active provider: in-memory set_provider() ->
+# this file's [active] table -> env DOPEST_PROVIDER_<CAP> -> code default -> first registered.
+
+[active]
+llm = "openrouter"      # openai | openrouter | flowdot
+stt = "fish"            # fish  (local whisperx/openai live in dopest_clip.stt, via STT_BACKEND)
+tts = "fish"            # fish | flowdot
+sfx = "elevenlabs"      # elevenlabs | flowdot
+audio_qa = "openai"     # openai | flowdot
+image = "gemini"        # gemini | flowdot
+
+# --- API keys are read from the ENVIRONMENT, never from this file ---
+#   OPENAI_API_KEY        OpenAI (LLM, audio QA, Whisper STT)
+#   OPENROUTER_API_KEY    OpenRouter (LLM aggregator)
+#   FISH_AUDIO_API_KEY    Fish Audio (TTS / ASR / voice clone)
+#   ELEVENLABS_API_KEY    ElevenLabs (sound effects)
+#   GEMINI_API_KEY        Google Gemini (image gen/edit/compose/analyze, BYOK)
+#   FLOWDOT_BASE_URL / FLOWDOT_API_KEY   FlowDot aggregator (LLM/image/audio)
+#
+# Editing knobs (also env): STT_BACKEND, WHISPERX_MODEL, DEVICE, MIN_SILENCE, ...
+# OBS recording (env): OBS_WS_HOST, OBS_WS_PORT, OBS_WS_PASSWORD, OBS_SCENE_NAME, OBS_CAMERA_DIR

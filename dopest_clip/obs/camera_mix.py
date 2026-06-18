@@ -1,0 +1,533 @@
+"""GPU camera mixing for the long-form workflow.
+
+Given a project whose SCREEN recording has been cut to an EDL, mix the separately
+recorded camera back in, background-removed, floating over the cut screen:
+
+  1. cut the camera to the SAME segment times as the screen cut (perfect sync),
+  2. matte out the background with RobustVideoMatting on the GPU,
+  3. composite the floating camera over the cut screen with animated position.
+
+The expensive cut+matte is CACHED per (project, edl), so repositioning ("move me
+over here for this part") only re-runs the cheap composite step.
+
+torch / cv2 (opencv) / numpy / moviepy are imported LAZILY inside the functions that
+need them, so importing this module needs none of them. Install with:
+``pip install dopest-clip[matting]`` (torch + opencv + numpy + moviepy).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from typing import Any
+
+from .. import config, edl as edlmod, project
+from . import timeline
+
+_RVM = None
+_NVENC = None
+
+
+def _nvenc_ok() -> bool:
+    """True if this ffmpeg has the h264_nvenc encoder (cached). Computed lazily so import
+    stays cheap and the import-hygiene tests don't spawn ffmpeg."""
+    global _NVENC
+    if _NVENC is None:
+        try:
+            out = subprocess.run([config.FFMPEG, "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True,
+                                 stdin=subprocess.DEVNULL).stdout
+            _NVENC = "h264_nvenc" in out
+        except Exception:  # noqa: BLE001
+            _NVENC = False
+    return _NVENC
+
+
+def _cuda_available() -> bool:
+    """True only if torch is importable AND a CUDA device is present. Used to pick the
+    GPU RVM matte vs the CPU rembg matte so background removal works on CPU-only boxes."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _load_rvm():
+    """Lazy-load RobustVideoMatting on the GPU (cached locally after first download).
+    Install with: pip install dopest-clip[matting]."""
+    global _RVM
+    if _RVM is None:
+        try:
+            import torch
+        except ImportError as e:  # noqa: BLE001
+            raise RuntimeError(
+                "GPU camera matting needs torch. Install with: pip install dopest-clip[matting]"
+            ) from e
+        _RVM = torch.hub.load("PeterL1n/RobustVideoMatting", "mobilenetv3").cuda().eval()
+    return _RVM
+
+
+def _resolve_segments(project_id: str, edl_id: str) -> list[tuple[float, float]]:
+    """The exact (start, end) source-time segments the screen render kept -- recomputed
+    deterministically (same cleanup + resolve the renderer ran)."""
+    transcript = project.read_transcript(project_id)
+    edl_obj = project.read_edl(project_id, edl_id)
+    cleaned = edl_obj
+    if edl_obj.get("cleanup"):
+        cleaned, _ = edlmod.apply_cleanup(edl_obj, transcript)
+    resolved = edlmod.resolve_edl(cleaned, transcript)
+    return [(float(s["start"]), float(s["end"])) for s in resolved["segments"]]
+
+
+def cut_video_only(src: str, segments: list[tuple[float, float]], out: str) -> None:
+    """Trim `src` to `segments` and concat (video only -- audio comes from the screen).
+    Uses a filter_complex SCRIPT file so hundreds of micro-cuts don't blow the cmdline."""
+    parts, labels = [], []
+    for i, (s, e) in enumerate(segments):
+        parts.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]")
+        labels.append(f"[v{i}]")
+    graph = ";".join(parts) + ";" + "".join(labels) + \
+        f"concat=n={len(segments)}:v=1:a=0[outv]"
+    fd, scriptf = tempfile.mkstemp(suffix=".txt")
+    os.close(fd)
+    with open(scriptf, "w", encoding="utf-8") as f:
+        f.write(graph)
+    try:
+        # media.run_ff is the single ffmpeg runner; it sets stdin=DEVNULL so ffmpeg
+        # never consumes the MCP server's stdio channel, and raises on non-zero exit.
+        from .. import media
+        media.run_ff(
+            [config.FFMPEG, "-y", "-loglevel", "error", "-i", src,
+             "-filter_complex_script", scriptf, "-map", "[outv]", "-an",
+             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", out])
+    finally:
+        os.remove(scriptf)
+
+
+def _ffmpeg_frame_writer(out: str, w: int, h: int, fps: float, gray: bool, crf: int):
+    """Encode a raw frame stream to mp4. Uses h264_nvenc (GPU encoder block) so the matte
+    loop is not bottlenecked on CPU x264 — on this pipeline the dual libx264 encodes of the
+    foreground + alpha were the limiter (~15 fps); nvenc frees the CPU. Falls back to
+    libx264 if nvenc is unavailable (no NVIDIA encoder / older ffmpeg)."""
+    pix = "gray" if gray else "rgb24"
+    base = [config.FFMPEG, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", pix,
+            "-s", f"{w}x{h}", "-r", f"{fps:.4f}", "-i", "-"]
+    if _nvenc_ok():
+        enc = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", str(crf), "-pix_fmt", "yuv420p", out]
+    else:
+        enc = ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p", out]
+    return subprocess.Popen(base + enc, stdin=subprocess.PIPE)
+
+
+def rvm_matte(src: str, fgr_out: str, pha_out: str,
+              downsample: float = 0.25, chunk: int = 12) -> None:
+    """RVM GPU matte: write the foreground (fgr_out) and the alpha (pha_out) as videos,
+    streaming so memory stays flat on long clips. Install: pip install dopest-clip[matting]."""
+    try:
+        import cv2
+        import numpy as np
+        import torch
+    except ImportError as e:  # noqa: BLE001
+        raise RuntimeError(
+            "GPU camera matting needs torch + opencv-python + numpy. "
+            "Install with: pip install dopest-clip[matting]"
+        ) from e
+
+    model = _load_rvm()
+    cap = cv2.VideoCapture(src)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    wf = _ffmpeg_frame_writer(fgr_out, w, h, fps, gray=False, crf=18)
+    wp = _ffmpeg_frame_writer(pha_out, w, h, fps, gray=True, crf=12)
+    rec: list = [None] * 4
+    buf: list = []
+
+    def flush():
+        nonlocal rec
+        if not buf:
+            return
+        t = (torch.from_numpy(np.stack(buf)).cuda().float().div(255)
+             .permute(0, 3, 1, 2).unsqueeze(0))  # [1,T,3,H,W] RGB
+        with torch.no_grad():
+            fgr, pha, *rec = model(t, *rec, downsample)
+        fgr_np = (fgr[0].clamp(0, 1).cpu().numpy().transpose(0, 2, 3, 1) * 255).astype("uint8")
+        pha_np = (pha[0, :, 0].clamp(0, 1).cpu().numpy() * 255).astype("uint8")
+        for k in range(fgr_np.shape[0]):
+            wf.stdin.write(fgr_np[k].tobytes())     # RGB
+            wp.stdin.write(pha_np[k].tobytes())     # gray
+        buf.clear()
+
+    try:
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
+            buf.append(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+            if len(buf) >= chunk:
+                flush()
+        flush()
+    finally:
+        cap.release()
+        for p in (wf, wp):
+            p.stdin.close()
+            p.wait()
+
+
+def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
+                  keyframes: list[dict[str, Any]], out_path: str) -> dict[str, Any]:
+    """GPU composite: per-frame resize + alpha-blend of the matted camera onto the
+    screen on the GPU (torch/CUDA), encoded with NVENC. Much faster than the moviepy
+    path. Audio is muxed from the screen file. Raises on any failure so the caller can
+    fall back to the CPU composite."""
+    import cv2
+    import torch
+
+    cap_s = cv2.VideoCapture(screen_path)
+    cap_f = cv2.VideoCapture(fgr_path)
+    cap_p = cv2.VideoCapture(pha_path)
+    fps = cap_s.get(cv2.CAP_PROP_FPS) or 30.0
+    fw = int(cap_s.get(cv2.CAP_PROP_FRAME_WIDTH))
+    fh = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cw = int(cap_f.get(cv2.CAP_PROP_FRAME_WIDTH))
+    ch = int(cap_f.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    aspect = cw / ch
+    kfs = timeline.normalize_keyframes(keyframes)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    proc = subprocess.Popen(
+        [config.FFMPEG, "-y", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{fw}x{fh}", "-r", f"{fps:.4f}",
+         "-i", "pipe:0", "-i", screen_path,
+         "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "h264_nvenc", "-preset", "p4",
+         "-cq", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+         "-shortest", out_path],
+        stdin=subprocess.PIPE)
+
+    dev = "cuda"
+    idx = 0
+    try:
+        with torch.no_grad():
+            while True:
+                ok_s, s = cap_s.read()
+                if not ok_s:
+                    break
+                ok_f, f = cap_f.read()
+                ok_p, p = cap_p.read()
+                if not (ok_f and ok_p):
+                    break
+                t = idx / fps
+                idx += 1
+                x, y, w, h = timeline.sample(kfs, t, fw, fh, aspect)
+                screen = torch.from_numpy(cv2.cvtColor(s, cv2.COLOR_BGR2RGB)).to(dev).float()
+                fgr = (torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float()
+                       .permute(2, 0, 1).unsqueeze(0))
+                pha = (torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float()
+                       .div(255.0).unsqueeze(0).unsqueeze(0))
+                fgr_r = torch.nn.functional.interpolate(
+                    fgr, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+                pha_r = torch.nn.functional.interpolate(
+                    pha, size=(h, w), mode="bilinear", align_corners=False)[0, 0].unsqueeze(-1)
+                x0, y0 = max(0, x), max(0, y)
+                x1, y1 = min(fw, x + w), min(fh, y + h)
+                if x1 > x0 and y1 > y0:
+                    fx0, fy0 = x0 - x, y0 - y
+                    roi = screen[y0:y1, x0:x1, :]
+                    a = pha_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                    fg = fgr_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                    screen[y0:y1, x0:x1, :] = fg * a + roi * (1 - a)
+                proc.stdin.write(screen.clamp(0, 255).byte().cpu().numpy().tobytes())
+    finally:
+        cap_s.release(); cap_f.release(); cap_p.release()
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"nvenc composite failed (ffmpeg rc={rc})")
+    return {"output": out_path, "size": [fw, fh], "duration": round(idx / fps, 2)}
+
+
+def composite(screen_path: str, fgr_path: str, pha_path: str | None,
+              keyframes: list[dict[str, Any]], out_path: str) -> dict[str, Any]:
+    """Composite the (matted) camera over the cut screen with animated position. Cheap
+    relative to the matte -- this is what reposition re-runs. CPU moviepy path."""
+    try:
+        from moviepy import CompositeVideoClip, VideoFileClip
+    except ImportError as e:  # noqa: BLE001
+        raise RuntimeError(
+            "composite() needs moviepy. Install with: pip install dopest-clip[matting]"
+        ) from e
+
+    screen = VideoFileClip(screen_path)
+    fgr = VideoFileClip(fgr_path)
+    cam = fgr.without_audio()
+    if pha_path:
+        cam = cam.with_mask(VideoFileClip(pha_path).to_mask())
+    fw, fh = screen.size
+    aspect = cam.w / cam.h
+    kfs = timeline.normalize_keyframes(keyframes)
+    dur = min(screen.duration, cam.duration)
+
+    def rect(t: float):
+        return timeline.sample(kfs, t, fw, fh, aspect)
+
+    cam_layer = (cam.resized(lambda t: (rect(t)[2], rect(t)[3]))
+                 .with_position(lambda t: (rect(t)[0], rect(t)[1])))
+    final = CompositeVideoClip([screen, cam_layer], size=(fw, fh)).with_duration(dur)
+    if screen.audio is not None:
+        final = final.with_audio(screen.audio.subclipped(0, dur))
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    final.write_videofile(out_path, codec="libx264", audio_codec="aac",
+                          fps=screen.fps, preset="medium",
+                          threads=os.cpu_count() or 4, logger=None)
+    for c in (final, cam_layer, cam, fgr, screen):
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"output": out_path, "size": [fw, fh], "duration": round(dur, 2)}
+
+
+def mix(project_id: str, edl_id: str, camera_path: str,
+        keyframes: list[dict[str, Any]] | None = None,
+        remove_background: bool = True, output_path: str = "",
+        rematte: bool = False) -> dict[str, Any]:
+    """Mix the camera into a project's cut screen. The cut + matte are CACHED per
+    (project, edl) under <project>/camera/; pass rematte=True to force a rebuild (e.g.
+    after changing the cut). Requires render(project_id, edl_id) to have produced the
+    cut screen first. `keyframes` is the camera animation timeline (default: a static
+    bottom-right PIP)."""
+    pdir = project.require_project(project_id)
+    slug = project.slugify(edl_id)
+    cut_screen = pdir / "renders" / f"{slug}.mp4"
+    if not cut_screen.exists():
+        raise FileNotFoundError(
+            f"cut screen not found at {cut_screen}. Run render(project_id, edl_id='{edl_id}') first.")
+    if not os.path.isfile(camera_path):
+        raise FileNotFoundError(f"camera file not found: {camera_path}")
+
+    cam_dir = pdir / "camera"
+    cam_dir.mkdir(exist_ok=True)
+    cut_cam = cam_dir / f"{slug}_cut.mp4"
+    if rematte or not cut_cam.exists():
+        cut_video_only(camera_path, _resolve_segments(project_id, edl_id), str(cut_cam))
+
+    if not keyframes:
+        keyframes = [{"t": 0, "preset": "bottom-right"}]
+    out = output_path or str(pdir / "renders" / f"{slug}_mixed.mp4")
+
+    cached = False
+    backend = "raw-inset"
+    if remove_background and _cuda_available():
+        # GPU path: RVM matte (cached fgr/pha) + NVENC composite, CPU composite on failure.
+        fgr = cam_dir / f"{slug}_fgr.mp4"
+        pha = cam_dir / f"{slug}_pha.mp4"
+        if rematte or not (fgr.exists() and pha.exists()):
+            rvm_matte(str(cut_cam), str(fgr), str(pha))
+        else:
+            cached = True
+        try:
+            info = composite_gpu(str(cut_screen), str(fgr), str(pha), keyframes, out)
+            backend = "rvm-gpu"
+        except Exception:  # noqa: BLE001
+            info = composite(str(cut_screen), str(fgr), str(pha), keyframes, out)
+            backend = "rvm-gpu+cpu-composite"
+    elif remove_background:
+        # No CUDA: matte on CPU with rembg (slower) so the cutout still works.
+        from . import compositor
+        info = compositor.compose(str(cut_screen), str(cut_cam), keyframes, out,
+                                  remove_background=True)
+        backend = "rembg-cpu"
+    else:
+        info = composite(str(cut_screen), str(cut_cam), None, keyframes, out)
+    info.update({"project_id": project_id, "edl_id": edl_id,
+                 "background_removed": remove_background, "matte_cached": cached,
+                 "matte_backend": backend})
+    return info
+
+
+def _trim(src: str, t0: float, dur: float, out: str, audio: bool = False) -> None:
+    """Trim a clip to [t0, t0+dur]. Uses media.run_ff (stdin=DEVNULL) so it never
+    consumes the MCP server's stdio channel."""
+    from .. import media
+    cmd = [config.FFMPEG, "-y", "-loglevel", "error", "-ss", str(t0), "-t", str(dur),
+           "-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16"]
+    cmd += (["-c:a", "aac"] if audio else ["-an"])
+    cmd.append(out)
+    media.run_ff(cmd)
+
+
+def write_cut_transcript(project_id: str, edl_id: str) -> tuple[str, str, int]:
+    """Derive the CUT-timeline transcript (the final spoken words after cleanup + cut,
+    re-indexed 0..N with cut-timeline timestamps) and write .json + readable .txt next to
+    the render. Shorts are designed against THESE indices. Returns (json, txt, n_words)."""
+    import json
+
+    pdir = project.project_dir(project_id)
+    slug = project.slugify(edl_id)
+    transcript = project.read_transcript(project_id)
+    edl_obj = project.read_edl(project_id, edl_id)
+    cleaned = edl_obj
+    if edl_obj.get("cleanup"):
+        cleaned, _ = edlmod.apply_cleanup(edl_obj, transcript)
+    resolved = edlmod.resolve_edl(cleaned, transcript)
+    words = edlmod.remap_to_output_timeline(resolved, transcript)
+    for i, w in enumerate(words):
+        w["i"] = i
+
+    cj = pdir / "renders" / f"{slug}.cut_transcript.json"
+    cj.parent.mkdir(parents=True, exist_ok=True)
+    cj.write_text(json.dumps({"words": words}), encoding="utf-8")
+
+    lines = [f"# Cut transcript for project '{project_id}' edl '{edl_id}' | words: {len(words)}",
+             "# [mm:ss.xxx] (#word_index) text  -- design shorts by these CUT-timeline indices", ""]
+    cur: list[str] = []
+    ci, ct0 = 0, 0.0
+    for w in words:
+        if not cur:
+            ci, ct0 = w["i"], float(w["start"])
+        cur.append(w["w"])
+        if len(cur) >= 16:
+            lines.append(f"[{int(ct0 // 60):02d}:{ct0 - 60 * int(ct0 // 60):06.3f}] (#{ci}) " + " ".join(cur))
+            cur = []
+    if cur:
+        lines.append(f"[{int(ct0 // 60):02d}:{ct0 - 60 * int(ct0 // 60):06.3f}] (#{ci}) " + " ".join(cur))
+    ct = pdir / "renders" / f"{slug}.cut_transcript.txt"
+    ct.write_text("\n".join(lines), encoding="utf-8")
+    return str(cj), str(ct), len(words)
+
+
+def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
+                  from_word: int, to_word: int, hook_title: str, out_path: str,
+                  caption_preset: str = "karaoke-bold", title_hold: float = 2.5,
+                  screen_top_y: int = 280, person_h: int = 1180,
+                  screen_keyframes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Render a 9:16 SHORT-FORM clip: hook + karaoke captions in the TOP band, the screen
+    in the MIDDLE (per-frame GPU crop+zoom from `screen_keyframes` so it can zoom into
+    what's being discussed), and the background-removed person BIG at the BOTTOM over a
+    blurred-screen backdrop. `screen_keyframes`: [{t, zoom, focus:[nx,ny], ease}] (zoom
+    1.0 = full overview, 2.0 = 2x into focus). None = static full screen. GPU/NVENC."""
+    import json
+    import tempfile
+
+    import cv2
+    import torch
+
+    from .. import captions, media
+
+    words = json.load(open(transcript_json, encoding="utf-8"))["words"]
+    t0 = float(words[from_word]["start"])
+    dur = float(words[to_word]["end"]) - t0
+    local = [{"w": words[i]["w"],
+              "start": round(float(words[i]["start"]) - t0, 3),
+              "end": round(float(words[i]["end"]) - t0, 3)}
+             for i in range(from_word, to_word + 1)]
+    ass = captions.build_ass(local, 1080, 1920, preset=caption_preset, position="top",
+                             margin_v=40, title=hook_title, title_hold=title_hold)
+    ass_path = os.path.splitext(out_path)[0] + ".ass"
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(ass)
+    skfs = timeline.normalize_screen_keyframes(screen_keyframes or [])
+
+    tmp = tempfile.mkdtemp()
+    cs, cf, cp = os.path.join(tmp, "s.mp4"), os.path.join(tmp, "f.mp4"), os.path.join(tmp, "p.mp4")
+    _trim(screen_cut, t0, dur, cs, audio=True)
+    _trim(fgr, t0, dur, cf)
+    _trim(pha, t0, dur, cp)
+
+    cap_s, cap_f, cap_p = cv2.VideoCapture(cs), cv2.VideoCapture(cf), cv2.VideoCapture(cp)
+    fps = cap_s.get(cv2.CAP_PROP_FPS) or 30.0
+    sw, sh = int(cap_s.get(3)), int(cap_s.get(4))
+    pfw, pfh = int(cap_f.get(3)), int(cap_f.get(4))
+    CW, CH = 1080, 1920
+    disp_w, disp_h = 1080, int(round(1080 * sh / sw))   # screen display zone (e.g. 1080x607)
+    pw = int(round(pfw * person_h / pfh))               # person scaled to person_h tall
+
+    sub = (f"subtitles=filename='{media.escape_filter_path(ass_path)}'"
+           f":fontsdir='{media.escape_filter_path(str(captions.FONTS_DIR))}'")
+    proc = subprocess.Popen(
+        [config.FFMPEG, "-y", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CW}x{CH}", "-r", f"{fps:.4f}",
+         "-i", "pipe:0", "-i", cs,
+         "-filter_complex", f"[0:v]{sub}[v]", "-map", "[v]", "-map", "1:a:0?",
+         "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-shortest", out_path],
+        stdin=subprocess.PIPE)
+
+    dev = "cuda"
+    idx = 0
+    try:
+        with torch.no_grad():
+            while True:
+                ok_s, s = cap_s.read()
+                if not ok_s:
+                    break
+                ok_f, f = cap_f.read()
+                ok_p, p = cap_p.read()
+                if not (ok_f and ok_p):
+                    break
+                t = idx / fps
+                idx += 1
+                screen = torch.from_numpy(cv2.cvtColor(s, cv2.COLOR_BGR2RGB)).to(dev).float()
+                # background: blurred + darkened full screen stretched to canvas
+                base = screen.permute(2, 0, 1).unsqueeze(0)
+                small = torch.nn.functional.interpolate(base, size=(96, 54), mode="bilinear", align_corners=False)
+                bg = torch.nn.functional.interpolate(small, size=(CH, CW), mode="bilinear", align_corners=False)[0].permute(1, 2, 0) * 0.45
+                canvas = bg.clone()
+                # middle: zoomed screen crop -> display zone
+                cx, cy, cw, ch = timeline.sample_screen(skfs, t, sw, sh)
+                crop = screen[cy:cy + ch, cx:cx + cw, :].permute(2, 0, 1).unsqueeze(0)
+                disp = torch.nn.functional.interpolate(crop, size=(disp_h, disp_w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+                canvas[screen_top_y:screen_top_y + disp_h, 0:disp_w, :] = disp
+                # bottom: big background-removed person, bottom-centre
+                fgr_t = torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float().permute(2, 0, 1).unsqueeze(0)
+                pha_t = torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float().div(255.0).unsqueeze(0).unsqueeze(0)
+                fr = torch.nn.functional.interpolate(fgr_t, size=(person_h, pw), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+                ar = torch.nn.functional.interpolate(pha_t, size=(person_h, pw), mode="bilinear", align_corners=False)[0, 0].unsqueeze(-1)
+                px, py = (CW - pw) // 2, CH - person_h
+                x0, y0 = max(0, px), max(0, py)
+                x1, y1 = min(CW, px + pw), min(CH, py + person_h)
+                fx0, fy0 = x0 - px, y0 - py
+                a = ar[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                fg = fr[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                canvas[y0:y1, x0:x1, :] = fg * a + canvas[y0:y1, x0:x1, :] * (1 - a)
+                proc.stdin.write(canvas.clamp(0, 255).byte().cpu().numpy().tobytes())
+    finally:
+        cap_s.release(); cap_f.release(); cap_p.release()
+        proc.stdin.close()
+        rc = proc.wait()
+        for fp in (cs, cf, cp):
+            try:
+                os.remove(fp)
+            except OSError:
+                pass
+    if rc != 0:
+        raise RuntimeError(f"vertical_clip nvenc failed (rc={rc})")
+    return {"output": out_path, "size": [CW, CH], "duration": round(dur, 2),
+            "hook": hook_title, "zoomed": bool(skfs)}
+
+
+def short_clip(project_id: str, edl_id: str, from_word: int, to_word: int,
+               hook_title: str, screen_keyframes: list[dict[str, Any]] | None = None,
+               caption_preset: str = "karaoke-bold", output_path: str = "") -> dict[str, Any]:
+    """Render a 9:16 short-form clip (vertical stacked layout + optional screen zoom) from
+    a project's cut screen + cached camera matte. Requires render() (cut screen) and
+    mix_camera(remove_background=True) (matte) to have run for `edl_id`. `from_word`/
+    `to_word` index the CUT transcript (see write_cut_transcript / get_cut_transcript)."""
+    pdir = project.require_project(project_id)
+    slug = project.slugify(edl_id)
+    cut_screen = pdir / "renders" / f"{slug}.mp4"
+    fgr = pdir / "camera" / f"{slug}_fgr.mp4"
+    pha = pdir / "camera" / f"{slug}_pha.mp4"
+    if not cut_screen.exists():
+        raise FileNotFoundError(f"cut screen not found ({cut_screen}); run render(edl_id='{edl_id}') first")
+    if not (fgr.exists() and pha.exists()):
+        raise FileNotFoundError(
+            "camera matte not found; run mix_camera(remove_background=True) first (GPU matte)")
+    cj, _, _ = write_cut_transcript(project_id, edl_id)
+    out = output_path or str(pdir / "renders" / f"{slug}_short_{from_word}-{to_word}.mp4")
+    return vertical_clip(str(cut_screen), str(fgr), str(pha), cj, from_word, to_word,
+                         hook_title, out, caption_preset=caption_preset,
+                         screen_keyframes=screen_keyframes)

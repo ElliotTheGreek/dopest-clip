@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dopest-clip"
+version = "0.1.0"
+description = "Open-source, MCP-first, provider-agnostic media studio: record (OBS) -> edit (transcript-driven clipper) -> produce. Drivable by an MCP agent and by a human in an Electron editor."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "FlowDot" }]
+keywords = ["mcp", "video", "editor", "obs", "transcript", "ffmpeg", "shorts"]
+
+# Base install = ffmpeg-driven editing only (no torch/ML, no OBS deps).
+dependencies = [
+    "mcp>=1.2.0",
+    "Pillow>=10.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+# Speech-to-text. WhisperX pulls torch; openai is the cloud path.
+stt = ["whisperx", "torch", "torchaudio", "openai>=1.0"]
+# Subject-tracked portrait reframe.
+reframe = ["ultralytics", "opencv-python", "numpy>=1.26"]
+# Background matting / compositing for the OBS camera-over-screen workflow.
+matting = ["moviepy>=2.0.0", "rembg>=2.0.0", "onnxruntime>=1.17", "torch", "numpy>=1.26"]
+# SVG overlays for the compositor.
+graphics = ["resvg-py"]
+# OBS WebSocket recording control.
+obs = ["websocket-client>=1.7"]
+# Everything (a full local workstation install).
+all = [
+    "whisperx", "torch", "torchaudio", "openai>=1.0",
+    "ultralytics", "opencv-python", "numpy>=1.26",
+    "moviepy>=2.0.0", "rembg>=2.0.0", "onnxruntime>=1.17",
+    "resvg-py", "websocket-client>=1.7",
+]
+dev = ["pytest>=8.0", "pytest-mock>=3.12", "tomli; python_version < '3.11'"]
+
+[project.scripts]
+dopest-clip = "dopest_clip.__main__:main"
+
+[tool.setuptools]
+packages = ["dopest_clip", "dopest_clip.stt", "dopest_clip.providers", "dopest_clip.audio", "dopest_clip.image", "dopest_clip.obs"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+dopest_clip = ["assets/*", "assets/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "needs_ffmpeg: requires ffmpeg/ffprobe on PATH",
+    "needs_obs: requires a running OBS with obs-websocket",
+    "needs_gpu: requires CUDA",
+    "needs_matting: requires the matting extra (moviepy/torch/cv2)",
+    "needs_network: hits an external provider API",
+]
