@@ -83,7 +83,8 @@ def compose(
     cache_dir = os.path.dirname(os.path.abspath(output_path))
     overlay_clips = [
         _build_overlay(o, fw, fh, duration,
-                       track=tracking.resolve_track(o.get("track"), screen_path, camera_path, cache_dir))
+                       track=tracking.resolve_track(o.get("track"), screen_path, camera_path, cache_dir),
+                       offset=(o.get("track") or {}).get("offset"))
         for o in (overlays or [])
     ]
     layers.extend(overlay_clips)  # overlays render on top of the camera
@@ -122,7 +123,7 @@ def _load_rgba(path: str):  # type: ignore[no-untyped-def]
     return np.array(Image.open(path).convert("RGBA"))
 
 
-def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float, track=None):  # type: ignore[no-untyped-def]
+def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float, track=None, offset=None):  # type: ignore[no-untyped-def]
     """Build one animated overlay layer.
 
     spec source (one of):
@@ -155,7 +156,8 @@ def _build_overlay(spec: dict[str, Any], fw: int, fh: int, duration: float, trac
     def r(local_t: float) -> tuple[int, int, int, int]:
         rect = timeline.sample_overlay(kfs, t_in + local_t, fw, fh, aspect, anchor)
         if track:
-            rect = tracking.apply_track_to_rect(rect, track, t_in + local_t, fw, fh, anchor=anchor)
+            rect = tracking.apply_track_to_rect(rect, track, t_in + local_t, fw, fh,
+                                                anchor=anchor, offset=offset)
         return rect
 
     layer = (

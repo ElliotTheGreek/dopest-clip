@@ -114,6 +114,13 @@ Every effect above sits at static keyframes. To make one RIDE a moving target in
 - source = `"screen"` (default; tracks the cut screen) or `"camera"` (tracks the cut camera —
   use for `"face"`). A screen-zoom that rides the cursor, an arrow glued to a button, a ring
   that tracks the face: same `track` field, different target.
+- `offset: [ox, oy]` places the effect RELATIVE to the target, in units of the tracked box size
+  (so it scales with the target). This is how the caller says WHERE around the target: a halo/
+  lightbulb ABOVE the head = `track:{target:"face", source:"camera", offset:[0,-0.9]}` on an
+  overlay anchored bottom-centre; a ring AROUND the head = `offset:[0,0]` with the ring scaled to
+  the head; a badge to the side = `offset:[0.9,0]`. A camera-source overlay maps through the
+  per-frame composited camera rect, so it lands on the cutout whether the camera is PIP,
+  fullscreen, or animated.
 - preview_track(project_id, edl_id, target, source=…) FIRST — it runs the detector and returns
   a downsampled track + a frame with the tracked point drawn, so you confirm the lock before a
   full render. The track is cached per (video, target) under <project>/camera/.

@@ -279,15 +279,20 @@ def _prep_overlays(overlays, fw: int, screen_path=None, cam_path=None, cache_dir
             base_w = max(k["scale"] for k in kfs) * fw
             arr = graphics.render_svg(svg, int(min(max(base_w * 2, 64), 2 * fw)))
         oh, ow = arr.shape[0], arr.shape[1]
+        tspec = spec.get("track") or {}
         out.append({"arr": arr, "anchor": anchor, "kfs": kfs, "aspect": ow / oh,
                     "t_in": float(spec.get("t_in", kfs[0]["t"])), "t_out": spec.get("t_out"),
                     "fade": float(spec.get("fade", 0.3)), "opacity": float(spec.get("opacity", 1.0)),
-                    "track": _compute_track(spec.get("track"), screen_path, cam_path, cache_dir)})
+                    "track": _compute_track(spec.get("track"), screen_path, cam_path, cache_dir),
+                    "track_cam": tspec.get("source") == "camera", "track_offset": tspec.get("offset")})
     return out
 
 
-def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duration: float):
-    """Alpha-composite active prepared overlays onto an HxWx3 GPU canvas at time t."""
+def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duration: float,
+                        cam_rect=None):
+    """Alpha-composite active prepared overlays onto an HxWx3 GPU canvas at time t. `cam_rect`
+    = the per-frame composited camera rect (x,y,w,h), so a camera-source tracked overlay (e.g.
+    a bulb over the tracked head) lands on the cutout wherever the camera currently sits."""
     if not prepped:
         return canvas_hw3
     import torch
@@ -304,8 +309,9 @@ def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duratio
             continue
         x, y, w, h = timeline.sample_overlay(o["kfs"], t, fw, fh, o["aspect"], o["anchor"])
         if o.get("track"):
-            x, y, w, h = tracking.apply_track_to_rect((x, y, w, h), o["track"], t, fw, fh,
-                                                      anchor=o["anchor"])
+            x, y, w, h = tracking.apply_track_to_rect(
+                (x, y, w, h), o["track"], t, fw, fh, anchor=o["anchor"],
+                src_rect=(cam_rect if o.get("track_cam") else None), offset=o.get("track_offset"))
         if w < 1 or h < 1:
             continue
         rgba = torch.from_numpy(o["arr"]).to(canvas_hw3.device).float().permute(2, 0, 1).unsqueeze(0)
@@ -428,7 +434,8 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                         fg = fgr_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
                         screen[y0:y1, x0:x1, :] = fg * a + roi * (1 - a)
                 if prepped:
-                    screen = _paste_overlays_gpu(screen, prepped, t, fw, fh, duration)
+                    screen = _paste_overlays_gpu(screen, prepped, t, fw, fh, duration,
+                                                 cam_rect=(x, y, w, h))
                 proc.stdin.write(screen.clamp(0, 255).byte().cpu().numpy().tobytes())
     finally:
         cap_s.release(); cap_f.release(); cap_p.release()
@@ -710,7 +717,8 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
                 fg = fr[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
                 canvas[y0:y1, x0:x1, :] = fg * a + canvas[y0:y1, x0:x1, :] * (1 - a)
                 if prepped:
-                    canvas = _paste_overlays_gpu(canvas, prepped, t, CW, CH, dur)
+                    canvas = _paste_overlays_gpu(canvas, prepped, t, CW, CH, dur,
+                                                 cam_rect=(px, py, pw, person_h))
                 proc.stdin.write(canvas.clamp(0, 255).byte().cpu().numpy().tobytes())
     finally:
         cap_s.release(); cap_f.release(); cap_p.release()

@@ -147,10 +147,23 @@ the page scrolls, the face-ring auto-tracks the face, etc. The missing piece is 
    `tests/test_tracking.py` covers the pure logic + cursor/face/template/yolo detector wiring at
    96% (the 7 misses are defensive weak-match guards + the real-face-found branch, exercised live).
    283 passed / 6 skipped.
-5. **Verify on demo1** — PENDING (needs the server restart so the new MCP code loads): preview_track
-   for cursor/face/template, then re-render landscape with cursor-follow zoom + button-glued arrow +
-   face-follow ring. Also still TODO: create `assets/cursor.png` (crop the OS pointer from a demo1
-   grab_frame) — until then cursor tracking raises a clear "crop one" error.
+5. **Verify on demo1** — DONE (2026-06-18, live via MCP after restart). `assets/cursor.png` created
+   (cropped the OS arrow from a demo1 grab_frame at src 251,565,22x24). preview_track proved ALL THREE
+   detectors lock, each with a drawn marker frame: `face` (camera, 6005 pts, marker on face), `cursor`
+   (screen, 6003 pts, marker on the pointer), `{template_at,region}` (screen UI box, follows it as the
+   page scrolls). Then rendered the landscape via start_render('mix_camera', screen_keyframes=[{zoom:1.5,
+   track:{target:'cursor'}}]) → demo_track_cursor.mp4 (200s, rvm-gpu/NVENC, matte_cached). Frames at
+   t=30/80/160 confirm the 1.5x zoom rides the pointer (panned left → centered → on the button).
+   CAMERA-SOURCE OVERLAY MAPPING — WIRED (2026-06-18, code-complete; needs restart to render):
+   apply_track_to_rect gained `src_rect` (map camera-normalized coords through the per-frame
+   composited camera rect, so a face-ring/bulb lands on the cutout at ANY camera placement —
+   PIP/fullscreen/animated) + `offset:[ox,oy]` in tracked-box-size units (the prescriptive
+   "where around the target": halo/bulb ABOVE head = offset[0,-0.9] anchored bottom-centre, ring
+   AROUND head = offset[0,0] scaled to head, badge to the side = offset[0.9,0]). Wired into
+   composite_gpu (passes the per-frame cam rect into _paste_overlays_gpu) + vertical_clip (person
+   rect) + CPU compositor (offset; camera src_rect GPU-path). Documented in mix_camera + learn.
+   286 py pass, control still 100%. NEXT: render demo1 lightbulb-over-head (face track, offset up)
+   at the "I had an idea" moment (~t11s) to prove it rides the head.
 
 > Earlier v2 polish (deferred, not parity): native file-picker, graphical keyframe-curve editor UI,
 > audio/image editor panels, FlowDot provider endpoint specifics.

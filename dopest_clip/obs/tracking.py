@@ -82,20 +82,38 @@ def sample_track(track: list[dict[str, float]], t: float) -> tuple[float, float,
 
 
 def apply_track_to_rect(rect, track, t: float, fw: int, fh: int, *,
-                        anchor=(0.5, 0.5), clamp: bool = False):
+                        anchor=(0.5, 0.5), clamp: bool = False, src_rect=None, offset=None):
     """Re-centre a pixel rect (x, y, w, h) on the tracked point at time t, KEEPING its size.
     This is the one bit of glue every tracked effect shares: a static keyframe still decides
     HOW BIG the effect is (overlay scale, blur radius, zoom level); the track only decides
     WHERE it sits. `anchor` = the (ax, ay) point on the rect that lands on the tracked centre
     (0.5,0.5 = box centre; an overlay passes its own anchor). `clamp` keeps the rect inside
-    the frame (used for a screen crop). Empty track => rect returned unchanged."""
+    the frame (used for a screen crop).
+
+    `src_rect` = (x, y, w, h) output-pixel rect the track's NORMALIZED coords live inside.
+    A camera-source track gives the target's position in the CAMERA frame; pass the per-frame
+    composited camera rect so the effect lands on the cutout wherever the camera sits (PIP,
+    fullscreen, animated). None => the track coords are already output-frame normalized
+    (screen targets). `offset` = (ox, oy) in units of the tracked box size — shift the
+    placement relative to the target (oy=-0.9 puts a bulb just ABOVE a tracked head).
+    Empty track => rect returned unchanged."""
     pos = sample_track(track, t)
     if pos is None:
         return rect
     w, h = rect[2], rect[3]
-    nx, ny = pos[0], pos[1]
-    x = nx * fw - anchor[0] * w
-    y = ny * fh - anchor[1] * h
+    nx, ny, nw, nh = pos
+    if src_rect is not None:
+        sx, sy, sw, sh = src_rect
+        cx, cy = sx + nx * sw, sy + ny * sh
+        bw, bh = nw * sw, nh * sh
+    else:
+        cx, cy = nx * fw, ny * fh
+        bw, bh = nw * fw, nh * fh
+    if offset is not None:
+        cx += offset[0] * bw
+        cy += offset[1] * bh
+    x = cx - anchor[0] * w
+    y = cy - anchor[1] * h
     if clamp:
         x = min(max(x, 0.0), max(0.0, fw - w))
         y = min(max(y, 0.0), max(0.0, fh - h))

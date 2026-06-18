@@ -77,6 +77,33 @@ def test_apply_track_to_rect_clamps_inside_frame():
     assert x == 200 - 40 and y == 100 - 20            # kept fully inside
 
 
+def test_apply_track_to_rect_src_rect_maps_camera_coords_to_output():
+    # face at camera-centre (0.5,0.5); camera composited as a 100x100 PIP at output (300,200)
+    tr = [{"t": 0.0, "x": 0.5, "y": 0.5, "w": 0.2, "h": 0.4}]
+    x, y, w, h = tracking.apply_track_to_rect((0, 0, 20, 20), tr, 0.0, 1000, 1000,
+                                              src_rect=(300, 200, 100, 100))
+    # camera-centre maps to output (300+50, 200+50)=(350,250); 20x20 box centred there
+    assert (x, y) == (340, 240)
+
+
+def test_apply_track_to_rect_offset_places_above_head():
+    # head centre at (0.5,0.5), head box 0.0 x 0.2 of a 100x500 frame -> head height 100px
+    tr = [{"t": 0.0, "x": 0.5, "y": 0.5, "w": 0.0, "h": 0.2}]
+    # offset oy=-0.9 -> shift up 0.9*100 = 90px from centre (250) -> 160; anchor bottom (0,1)
+    x, y, w, h = tracking.apply_track_to_rect((0, 0, 30, 40), tr, 0.0, 100, 500,
+                                              anchor=(0.5, 1.0), offset=(0.0, -0.9))
+    assert y == 160 - 40            # bottom of the box sits 90px above the head centre
+
+
+def test_apply_track_to_rect_offset_with_src_rect_uses_camera_box_size():
+    # face box 0.5 high in a 200px-tall camera PIP -> head height 100px in output
+    tr = [{"t": 0.0, "x": 0.5, "y": 0.5, "w": 0.4, "h": 0.5}]
+    x, y, w, h = tracking.apply_track_to_rect((0, 0, 10, 10), tr, 0.0, 1000, 1000,
+                                              src_rect=(0, 0, 200, 200), offset=(0.0, -1.0))
+    # centre = (100,100); offset up 1.0*(0.5*200)=100 -> y-centre 0; 10x10 centred -> y=-5
+    assert y == -5 and x == 95
+
+
 # --- _to_normalized: per-frame px -> smoothed normalized ------------------------------
 
 def test_to_normalized_shapes_and_bounds():

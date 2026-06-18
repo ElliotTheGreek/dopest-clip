@@ -233,10 +233,14 @@ def mix_camera(project_id: str, edl_id: str, camera_path: str, keyframes: list[d
     (`invert:true` = blur everything BUT the shape = "blur all but my face"); `screen_keyframes`
     crop+zoom the screen over time (zoom into a button); `bg_visible_until` keeps the FULL camera
     background visible until that second, then drops to the cutout. Any effect can FOLLOW a moving
-    target: add `track:{target, source}` inside an overlay/blur spec, or on a screen_keyframe/keyframe
-    (target = 'cursor' | 'face' | a COCO class | {template_at, region}; source 'screen'|'camera').
-    The static keyframes still set HOW BIG the effect is; the track sets WHERE it sits. Use
-    preview_track first to confirm the target locks on."""
+    target: add `track:{target, source, offset}` inside an overlay/blur spec, or on a screen_keyframe/
+    keyframe (target = 'cursor' | 'face' | a COCO class | {template_at, region}; source 'screen'|
+    'camera'). The static keyframes still set HOW BIG the effect is; the track sets WHERE it sits, and
+    `offset:[ox,oy]` (in units of the tracked box, so it scales with the target) places it RELATIVE to
+    the target: a halo/bulb ABOVE the head = source 'camera', target 'face', offset [0,-0.9]; a ring
+    AROUND the head = offset [0,0] with the ring scaled to the head; a badge to the side = offset
+    [0.9,0]. Camera-source overlays land on the cutout wherever the camera sits (PIP/fullscreen/
+    animated). Use preview_track first to confirm the target locks on."""
     from .obs import camera_mix
     return camera_mix.mix(project_id, edl_id, camera_path, keyframes=keyframes,
                           remove_background=remove_background, output_path=output_path,
