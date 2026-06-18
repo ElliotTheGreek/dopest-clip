@@ -221,11 +221,23 @@ def compose_camera(screen_path: str, camera_path: str, keyframes: list[dict], ou
 
 
 def mix_camera(project_id: str, edl_id: str, camera_path: str, keyframes: list[dict] | None = None,
-               remove_background: bool = True, output_path: str = "", rematte: bool = False) -> dict:
-    """Mix the camera into a project's already-rendered cut screen (GPU matte, cut-synced)."""
+               remove_background: bool = True, output_path: str = "", rematte: bool = False,
+               overlays: list[dict] | None = None, blurs: list[dict] | None = None,
+               screen_keyframes: list[dict] | None = None, bg_visible_until: float | None = None) -> dict:
+    """Mix the camera into a project's cut screen (GPU matte+NVENC, cut-synced) with the full
+    effect stack — all optional, all timed in CUT-timeline seconds (see get_cut_transcript):
+    `keyframes` animate the camera (presets fullscreen/center/pip/top-left/.../pos+scale, for
+    make-me-big / corner / slide); `overlays` are animated graphics (arrow/ring/box/label,
+    inline `svg`, or a transparent `image` PNG — for arrows, a ring on a face, a kitten in
+    hand) with keyframes + t_in/t_out/fade; `blurs` are animated screen blur/focus regions
+    (`invert:true` = blur everything BUT the shape = "blur all but my face"); `screen_keyframes`
+    crop+zoom the screen over time (zoom into a button); `bg_visible_until` keeps the FULL camera
+    background visible until that second, then drops to the cutout."""
     from .obs import camera_mix
     return camera_mix.mix(project_id, edl_id, camera_path, keyframes=keyframes,
-                          remove_background=remove_background, output_path=output_path, rematte=rematte)
+                          remove_background=remove_background, output_path=output_path,
+                          rematte=rematte, overlays=overlays, blurs=blurs,
+                          screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until)
 
 
 def get_cut_transcript(project_id: str, edl_id: str) -> dict:
@@ -246,17 +258,18 @@ def get_cut_transcript(project_id: str, edl_id: str) -> dict:
 
 def make_short(project_id: str, edl_id: str, from_word: int, to_word: int, hook_title: str,
                screen_keyframes: list[dict] | None = None, caption_preset: str = "karaoke-bold",
-               output_path: str = "") -> dict:
+               output_path: str = "", overlays: list[dict] | None = None) -> dict:
     """Render a 9:16 SHORT-FORM clip with the signature stacked layout: hook + karaoke
     captions in the TOP band, the screen (with optional per-frame zoom from
     `screen_keyframes`) in the MIDDLE, and the background-removed person BIG at the BOTTOM
-    over a blurred backdrop. Requires render(edl_id) (cut screen) and
-    mix_camera(edl_id, remove_background=True) (GPU matte) to have run first. `from_word`/
-    `to_word` index the CUT transcript (see get_cut_transcript). GPU/NVENC."""
+    over a blurred backdrop. `overlays` adds animated graphics (arrows/labels/etc.) on top.
+    Requires render(edl_id) (cut screen) and mix_camera(edl_id, remove_background=True) (GPU
+    matte) to have run first. `from_word`/`to_word` index the CUT transcript (see
+    get_cut_transcript). GPU/NVENC."""
     from .obs import camera_mix
     return camera_mix.short_clip(project_id, edl_id, from_word, to_word, hook_title,
                                  screen_keyframes=screen_keyframes, caption_preset=caption_preset,
-                                 output_path=output_path)
+                                 output_path=output_path, overlays=overlays)
 
 
 def list_graphics() -> dict:
@@ -281,6 +294,41 @@ def list_graphics() -> dict:
     }
 
 
+# --- async render jobs (long renders run in the background; poll instead of blocking) ----
+_RENDER_OPS = {"mix_camera", "make_short", "render", "compose_camera", "verify_clip"}
+
+
+def start_render(operation: str, params: dict | None = None) -> dict:
+    """Start a long render in the BACKGROUND and return a job_id immediately, so a
+    multi-minute render goes through MCP without a synchronous tool-call timeout. `operation`
+    is one of mix_camera / make_short / render / compose_camera / verify_clip; `params` is that
+    op's keyword args. Poll render_status(job_id) until status == 'done' (result holds the op's
+    return) or 'error'. Use this for any real-length render; the matte is cached so re-runs are
+    quick."""
+    from . import jobs
+    if operation not in _RENDER_OPS:
+        return {"error": f"start_render runs only {sorted(_RENDER_OPS)}, got {operation!r}"}
+    fn = OPERATIONS.get(operation)
+    if fn is None:
+        return {"error": f"unknown operation {operation!r}"}
+    jid = jobs.start(operation, fn, **(params or {}))
+    return {"job_id": jid, "operation": operation, "status": "running",
+            "next": f"poll render_status(job_id='{jid}')"}
+
+
+def render_status(job_id: str) -> dict:
+    """Poll a background render started with start_render: {status: running|done|error,
+    elapsed_s, result (the op's return when done), error (when failed)}."""
+    from . import jobs
+    return jobs.status(job_id)
+
+
+def list_render_jobs() -> dict:
+    """List all background render jobs this session with their status + elapsed time."""
+    from . import jobs
+    return jobs.list_jobs()
+
+
 # --- the operation registry (name -> callable), grouped for discovery -----------------
 GROUPS: dict[str, list] = {
     "editing": [create_project, transcribe, get_transcript, list_projects, get_project,
@@ -295,6 +343,7 @@ GROUPS: dict[str, list] = {
     "recording": [list_devices, setup_scene, start_recording, stop_recording,
                   recording_status, compose_camera, mix_camera, get_cut_transcript,
                   make_short, list_graphics],
+    "jobs": [start_render, render_status, list_render_jobs],
 }
 
 OPERATIONS: dict[str, object] = {fn.__name__: fn for fns in GROUPS.values() for fn in fns}

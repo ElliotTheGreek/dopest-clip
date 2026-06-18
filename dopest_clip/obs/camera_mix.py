@@ -176,25 +176,146 @@ def rvm_matte(src: str, fgr_out: str, pha_out: str,
             p.wait()
 
 
+# --- GPU effect helpers (shared by composite_gpu and vertical_clip) ------------------
+
+def _blur_gpu(img_hw3, strength: float):
+    """Cheap strong blur of an HxWx3 GPU tensor via downsample/upsample (no conv kernel).
+    `strength` ~ blur radius; larger = blurrier."""
+    import torch
+    h, w = int(img_hw3.shape[0]), int(img_hw3.shape[1])
+    k = max(2, int(round(float(strength) / 3.0)))
+    t = img_hw3.permute(2, 0, 1).unsqueeze(0)
+    small = torch.nn.functional.interpolate(
+        t, size=(max(1, h // k), max(1, w // k)), mode="bilinear", align_corners=False)
+    return torch.nn.functional.interpolate(
+        small, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+
+
+def _screen_zoom_gpu(screen_hw3, skfs, t: float, sw: int, sh: int):
+    """Crop+zoom an HxWx3 screen tensor per normalized screen keyframes; same size out."""
+    if not skfs:
+        return screen_hw3
+    import torch
+    cx, cy, cw, ch = timeline.sample_screen(skfs, t, sw, sh)
+    crop = screen_hw3[cy:cy + ch, cx:cx + cw, :].permute(2, 0, 1).unsqueeze(0)
+    return torch.nn.functional.interpolate(
+        crop, size=(sh, sw), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+
+
+def _apply_blurs_gpu(screen_hw3, blur_specs, t: float, fw: int, fh: int, duration: float):
+    """Blend a blurred copy of the screen where each active blur spec's mask is 1. Reuses
+    blur._amp (time window) + blur._mask (rect/circle/svg; focus = invert)."""
+    if not blur_specs:
+        return screen_hw3
+    import torch
+    from . import blur as blurmod
+    blurred = None
+    for s in blur_specs:
+        amp = blurmod._amp(s, t, duration)
+        if amp <= 0:
+            continue
+        if blurred is None:
+            blurred = _blur_gpu(screen_hw3, float(s.get("strength", 18)))
+        rect = timeline.sample_overlay(s["_kfs"], t, fw, fh, float(s.get("aspect", 1.0)), [0.5, 0.5])
+        m = blurmod._mask(s, rect, fw, fh) * amp  # HxW float numpy
+        mt = torch.from_numpy(m).to(screen_hw3.device).float().unsqueeze(-1)
+        screen_hw3 = screen_hw3 * (1 - mt) + blurred * mt
+        dim = float(s.get("dim", 0.0))
+        if dim > 0:
+            screen_hw3 = screen_hw3 * (1 - mt * dim)
+    return screen_hw3
+
+
+def _prep_overlays(overlays, fw: int):
+    """Pre-rasterize each overlay to an RGBA numpy array ONCE (svg/kind via resvg, or a
+    transparent PNG via image). Returns prepared dicts for per-frame compositing."""
+    if not overlays:
+        return []
+    from . import graphics
+    from .compositor import _load_rgba
+    out = []
+    for spec in overlays:
+        kfs = timeline.normalize_overlay_keyframes(spec["keyframes"])
+        if "image" in spec:
+            arr = _load_rgba(spec["image"])
+            anchor = spec.get("anchor", [0.5, 0.5])
+        else:
+            svg, anchor = graphics.build(spec)
+            base_w = max(k["scale"] for k in kfs) * fw
+            arr = graphics.render_svg(svg, int(min(max(base_w * 2, 64), 2 * fw)))
+        oh, ow = arr.shape[0], arr.shape[1]
+        out.append({"arr": arr, "anchor": anchor, "kfs": kfs, "aspect": ow / oh,
+                    "t_in": float(spec.get("t_in", kfs[0]["t"])), "t_out": spec.get("t_out"),
+                    "fade": float(spec.get("fade", 0.3)), "opacity": float(spec.get("opacity", 1.0))})
+    return out
+
+
+def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duration: float):
+    """Alpha-composite active prepared overlays onto an HxWx3 GPU canvas at time t."""
+    if not prepped:
+        return canvas_hw3
+    import torch
+    for o in prepped:
+        t_out = duration if o["t_out"] is None else float(o["t_out"])
+        t_in = o["t_in"]
+        if t < t_in or t > t_out:
+            continue
+        amp = o["opacity"]
+        fade = min(o["fade"], max(0.001, (t_out - t_in) / 2.0))
+        if fade > 0:
+            amp *= max(0.0, min((t - t_in) / fade, (t_out - t) / fade, 1.0))
+        if amp <= 0:
+            continue
+        x, y, w, h = timeline.sample_overlay(o["kfs"], t, fw, fh, o["aspect"], o["anchor"])
+        if w < 1 or h < 1:
+            continue
+        rgba = torch.from_numpy(o["arr"]).to(canvas_hw3.device).float().permute(2, 0, 1).unsqueeze(0)
+        rs = torch.nn.functional.interpolate(rgba, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(fw, x + w), min(fh, y + h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        ox0, oy0 = x0 - x, y0 - y
+        rgb = rs[oy0:oy0 + (y1 - y0), ox0:ox0 + (x1 - x0), :3]
+        al = rs[oy0:oy0 + (y1 - y0), ox0:ox0 + (x1 - x0), 3:4] / 255.0 * amp
+        canvas_hw3[y0:y1, x0:x1, :] = rgb * al + canvas_hw3[y0:y1, x0:x1, :] * (1 - al)
+    return canvas_hw3
+
+
 def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
-                  keyframes: list[dict[str, Any]], out_path: str) -> dict[str, Any]:
-    """GPU composite: per-frame resize + alpha-blend of the matted camera onto the
-    screen on the GPU (torch/CUDA), encoded with NVENC. Much faster than the moviepy
-    path. Audio is muxed from the screen file. Raises on any failure so the caller can
-    fall back to the CPU composite."""
+                  keyframes: list[dict[str, Any]], out_path: str, *,
+                  cut_cam_path: str | None = None, overlays: list[dict[str, Any]] | None = None,
+                  blurs: list[dict[str, Any]] | None = None,
+                  screen_keyframes: list[dict[str, Any]] | None = None,
+                  bg_visible_until: float | None = None) -> dict[str, Any]:
+    """GPU composite (torch/CUDA + NVENC): per-frame screen-zoom -> screen blur/focus ->
+    camera over screen (matted cutout, OR full opaque camera while t < bg_visible_until for
+    a mid-clip background drop) -> graphic overlays on top. Every effect is optional and
+    paid for only when its spec is present. Audio muxed from the screen. Raises on failure
+    so mix() can fall back to the CPU composite."""
     import cv2
     import torch
 
     cap_s = cv2.VideoCapture(screen_path)
     cap_f = cv2.VideoCapture(fgr_path)
     cap_p = cv2.VideoCapture(pha_path)
+    cap_c = cv2.VideoCapture(cut_cam_path) if (cut_cam_path and bg_visible_until is not None) else None
     fps = cap_s.get(cv2.CAP_PROP_FPS) or 30.0
     fw = int(cap_s.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    nframes = int(cap_s.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    duration = (nframes / fps) if nframes else 1e9
     cw = int(cap_f.get(cv2.CAP_PROP_FRAME_WIDTH))
     ch = int(cap_f.get(cv2.CAP_PROP_FRAME_HEIGHT))
     aspect = cw / ch
     kfs = timeline.normalize_keyframes(keyframes)
+    skfs = timeline.normalize_screen_keyframes(screen_keyframes or [])
+    blur_specs = []
+    for s in (blurs or []):
+        s2 = dict(s)
+        s2["_kfs"] = timeline.normalize_overlay_keyframes(s["keyframes"])
+        blur_specs.append(s2)
+    prepped = _prep_overlays(overlays, fw)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     proc = subprocess.Popen(
@@ -218,29 +339,53 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                 ok_p, p = cap_p.read()
                 if not (ok_f and ok_p):
                     break
+                cfrm = None
+                if cap_c is not None:
+                    ok_c, cfrm = cap_c.read()
+                    if not ok_c:
+                        cfrm = None
                 t = idx / fps
                 idx += 1
-                x, y, w, h = timeline.sample(kfs, t, fw, fh, aspect)
                 screen = torch.from_numpy(cv2.cvtColor(s, cv2.COLOR_BGR2RGB)).to(dev).float()
-                fgr = (torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float()
-                       .permute(2, 0, 1).unsqueeze(0))
-                pha = (torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float()
-                       .div(255.0).unsqueeze(0).unsqueeze(0))
-                fgr_r = torch.nn.functional.interpolate(
-                    fgr, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
-                pha_r = torch.nn.functional.interpolate(
-                    pha, size=(h, w), mode="bilinear", align_corners=False)[0, 0].unsqueeze(-1)
+                if skfs:
+                    screen = _screen_zoom_gpu(screen, skfs, t, fw, fh)
+                if blur_specs:
+                    screen = _apply_blurs_gpu(screen, blur_specs, t, fw, fh, duration)
+                x, y, w, h = timeline.sample(kfs, t, fw, fh, aspect)
                 x0, y0 = max(0, x), max(0, y)
                 x1, y1 = min(fw, x + w), min(fh, y + h)
-                if x1 > x0 and y1 > y0:
-                    fx0, fy0 = x0 - x, y0 - y
-                    roi = screen[y0:y1, x0:x1, :]
-                    a = pha_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
-                    fg = fgr_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
-                    screen[y0:y1, x0:x1, :] = fg * a + roi * (1 - a)
+                bg_visible = (bg_visible_until is not None) and (t < float(bg_visible_until))
+                if bg_visible and cfrm is not None:
+                    # background-visible phase: composite the FULL un-matted camera, opaque
+                    cam = (torch.from_numpy(cv2.cvtColor(cfrm, cv2.COLOR_BGR2RGB)).to(dev).float()
+                           .permute(2, 0, 1).unsqueeze(0))
+                    cam_r = torch.nn.functional.interpolate(
+                        cam, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+                    if x1 > x0 and y1 > y0:
+                        fx0, fy0 = x0 - x, y0 - y
+                        screen[y0:y1, x0:x1, :] = cam_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                else:
+                    fgr = (torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float()
+                           .permute(2, 0, 1).unsqueeze(0))
+                    pha = (torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float()
+                           .div(255.0).unsqueeze(0).unsqueeze(0))
+                    fgr_r = torch.nn.functional.interpolate(
+                        fgr, size=(h, w), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
+                    pha_r = torch.nn.functional.interpolate(
+                        pha, size=(h, w), mode="bilinear", align_corners=False)[0, 0].unsqueeze(-1)
+                    if x1 > x0 and y1 > y0:
+                        fx0, fy0 = x0 - x, y0 - y
+                        roi = screen[y0:y1, x0:x1, :]
+                        a = pha_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                        fg = fgr_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
+                        screen[y0:y1, x0:x1, :] = fg * a + roi * (1 - a)
+                if prepped:
+                    screen = _paste_overlays_gpu(screen, prepped, t, fw, fh, duration)
                 proc.stdin.write(screen.clamp(0, 255).byte().cpu().numpy().tobytes())
     finally:
         cap_s.release(); cap_f.release(); cap_p.release()
+        if cap_c is not None:
+            cap_c.release()
         proc.stdin.close()
         rc = proc.wait()
     if rc != 0:
@@ -292,12 +437,19 @@ def composite(screen_path: str, fgr_path: str, pha_path: str | None,
 def mix(project_id: str, edl_id: str, camera_path: str,
         keyframes: list[dict[str, Any]] | None = None,
         remove_background: bool = True, output_path: str = "",
-        rematte: bool = False) -> dict[str, Any]:
-    """Mix the camera into a project's cut screen. The cut + matte are CACHED per
-    (project, edl) under <project>/camera/; pass rematte=True to force a rebuild (e.g.
-    after changing the cut). Requires render(project_id, edl_id) to have produced the
-    cut screen first. `keyframes` is the camera animation timeline (default: a static
-    bottom-right PIP)."""
+        rematte: bool = False, overlays: list[dict[str, Any]] | None = None,
+        blurs: list[dict[str, Any]] | None = None,
+        screen_keyframes: list[dict[str, Any]] | None = None,
+        bg_visible_until: float | None = None) -> dict[str, Any]:
+    """Mix the camera into a project's cut screen with the full effect stack. The cut +
+    matte are CACHED per (project, edl) under <project>/camera/; pass rematte=True to force
+    a rebuild. Requires render(project_id, edl_id) first. `keyframes` = camera animation
+    (default static bottom-right PIP). `overlays` = animated graphics (arrow/ring/box/label/
+    inline-svg/image PNG). `blurs` = animated screen blur/focus (focus = invert). `screen_
+    keyframes` = screen crop+zoom over time. `bg_visible_until` = seconds (cut timeline) to
+    keep the FULL camera background visible before it drops to a cutout. Effects/cutout run
+    on the GPU (RVM+NVENC) when CUDA is present; CPU rembg fallback otherwise. All effect
+    times are cut-timeline seconds (see get_cut_transcript)."""
     pdir = project.require_project(project_id)
     slug = project.slugify(edl_id)
     cut_screen = pdir / "renders" / f"{slug}.mp4"
@@ -316,11 +468,12 @@ def mix(project_id: str, edl_id: str, camera_path: str,
     if not keyframes:
         keyframes = [{"t": 0, "preset": "bottom-right"}]
     out = output_path or str(pdir / "renders" / f"{slug}_mixed.mp4")
+    effects = bool(overlays or blurs or screen_keyframes or bg_visible_until is not None)
 
     cached = False
     backend = "raw-inset"
-    if remove_background and _cuda_available():
-        # GPU path: RVM matte (cached fgr/pha) + NVENC composite, CPU composite on failure.
+    if (remove_background or effects) and _cuda_available():
+        # GPU path: RVM matte (cached fgr/pha) + NVENC composite with the full effect stack.
         fgr = cam_dir / f"{slug}_fgr.mp4"
         pha = cam_dir / f"{slug}_pha.mp4"
         if rematte or not (fgr.exists() and pha.exists()):
@@ -328,16 +481,23 @@ def mix(project_id: str, edl_id: str, camera_path: str,
         else:
             cached = True
         try:
-            info = composite_gpu(str(cut_screen), str(fgr), str(pha), keyframes, out)
+            info = composite_gpu(str(cut_screen), str(fgr), str(pha), keyframes, out,
+                                 cut_cam_path=str(cut_cam), overlays=overlays, blurs=blurs,
+                                 screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until)
             backend = "rvm-gpu"
         except Exception:  # noqa: BLE001
-            info = composite(str(cut_screen), str(fgr), str(pha), keyframes, out)
-            backend = "rvm-gpu+cpu-composite"
-    elif remove_background:
-        # No CUDA: matte on CPU with rembg (slower) so the cutout still works.
+            # CPU fallback keeps overlays/blur (compositor.compose) but not screen-zoom/bg-toggle.
+            from . import compositor
+            info = compositor.compose(str(cut_screen), str(cut_cam), keyframes, out,
+                                      remove_background=True, overlays=overlays, blurs=blurs,
+                                      bg_visible_until=bg_visible_until)
+            backend = "rvm-gpu-failed+cpu-compose"
+    elif remove_background or effects:
+        # No CUDA: matte + overlays/blur on CPU via rembg/moviepy (slower).
         from . import compositor
         info = compositor.compose(str(cut_screen), str(cut_cam), keyframes, out,
-                                  remove_background=True)
+                                  remove_background=remove_background, overlays=overlays,
+                                  blurs=blurs, bg_visible_until=bg_visible_until)
         backend = "rembg-cpu"
     else:
         info = composite(str(cut_screen), str(cut_cam), None, keyframes, out)
@@ -402,7 +562,8 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
                   from_word: int, to_word: int, hook_title: str, out_path: str,
                   caption_preset: str = "karaoke-bold", title_hold: float = 2.5,
                   screen_top_y: int = 280, person_h: int = 1180,
-                  screen_keyframes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                  screen_keyframes: list[dict[str, Any]] | None = None,
+                  overlays: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Render a 9:16 SHORT-FORM clip: hook + karaoke captions in the TOP band, the screen
     in the MIDDLE (per-frame GPU crop+zoom from `screen_keyframes` so it can zoom into
     what's being discussed), and the background-removed person BIG at the BOTTOM over a
@@ -444,6 +605,7 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
     CW, CH = 1080, 1920
     disp_w, disp_h = 1080, int(round(1080 * sh / sw))   # screen display zone (e.g. 1080x607)
     pw = int(round(pfw * person_h / pfh))               # person scaled to person_h tall
+    prepped = _prep_overlays(overlays, CW)              # graphics on top of the 9:16 stack
 
     sub = (f"subtitles=filename='{media.escape_filter_path(ass_path)}'"
            f":fontsdir='{media.escape_filter_path(str(captions.FONTS_DIR))}'")
@@ -493,6 +655,8 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
                 a = ar[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
                 fg = fr[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
                 canvas[y0:y1, x0:x1, :] = fg * a + canvas[y0:y1, x0:x1, :] * (1 - a)
+                if prepped:
+                    canvas = _paste_overlays_gpu(canvas, prepped, t, CW, CH, dur)
                 proc.stdin.write(canvas.clamp(0, 255).byte().cpu().numpy().tobytes())
     finally:
         cap_s.release(); cap_f.release(); cap_p.release()
@@ -511,11 +675,12 @@ def vertical_clip(screen_cut: str, fgr: str, pha: str, transcript_json: str,
 
 def short_clip(project_id: str, edl_id: str, from_word: int, to_word: int,
                hook_title: str, screen_keyframes: list[dict[str, Any]] | None = None,
-               caption_preset: str = "karaoke-bold", output_path: str = "") -> dict[str, Any]:
-    """Render a 9:16 short-form clip (vertical stacked layout + optional screen zoom) from
-    a project's cut screen + cached camera matte. Requires render() (cut screen) and
-    mix_camera(remove_background=True) (matte) to have run for `edl_id`. `from_word`/
-    `to_word` index the CUT transcript (see write_cut_transcript / get_cut_transcript)."""
+               caption_preset: str = "karaoke-bold", output_path: str = "",
+               overlays: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Render a 9:16 short-form clip (vertical stacked layout + optional screen zoom +
+    optional graphic overlays) from a project's cut screen + cached camera matte. Requires
+    render() (cut screen) and mix_camera(remove_background=True) (matte) to have run for
+    `edl_id`. `from_word`/`to_word` index the CUT transcript (see get_cut_transcript)."""
     pdir = project.require_project(project_id)
     slug = project.slugify(edl_id)
     cut_screen = pdir / "renders" / f"{slug}.mp4"
@@ -530,4 +695,4 @@ def short_clip(project_id: str, edl_id: str, from_word: int, to_word: int,
     out = output_path or str(pdir / "renders" / f"{slug}_short_{from_word}-{to_word}.mp4")
     return vertical_clip(str(cut_screen), str(fgr), str(pha), cj, from_word, to_word,
                          hook_title, out, caption_preset=caption_preset,
-                         screen_keyframes=screen_keyframes)
+                         screen_keyframes=screen_keyframes, overlays=overlays)

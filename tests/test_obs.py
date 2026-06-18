@@ -331,10 +331,51 @@ def test_mismatched_id_does_not_resolve_wrong_waiter_eventually_raises():
 
 
 # --------------------------------------------------------------------------- #
+# ws.py: auto-reconnect after a dead socket (OBS restart -> WinError 10053)     #
+# --------------------------------------------------------------------------- #
+
+def test_request_reconnects_after_dropped_socket(monkeypatch):
+    """After OBS restarts, the cached socket is dead: send raises ConnectionAbortedError
+    (WinError 10053, an OSError). request() must drop it, reconnect, and retry ONCE."""
+    from dopest_clip.obs.ws import WSClient
+
+    class DeadSocket:
+        def send(self, data):
+            raise ConnectionAbortedError(10053, "An established connection was aborted")
+        def recv(self):
+            raise AssertionError("must not recv on the dead socket")
+        def close(self):
+            pass
+
+    good = FakeSocket([_resp("r2", "GetVersion", {"obsVersion": "32"})])  # retry uses rid r2
+    c = WSClient(host="x", port=1)
+    c._ws = DeadSocket()  # the stale socket left over from before the OBS restart
+    monkeypatch.setattr(c, "connect", lambda: setattr(c, "_ws", good))  # reconnect -> good socket
+    out = c.request("GetVersion")
+    assert out == {"obsVersion": "32"}
+    assert good.sent and good.sent[0]["d"]["requestType"] == "GetVersion"
+
+
+def test_request_does_not_reconnect_on_logical_failure(monkeypatch):
+    """A result:false response is an OBSError, not a transport drop -> NO reconnect/retry."""
+    from dopest_clip.obs.ws import OBSError, WSClient
+    fake = FakeSocket([_resp("r1", "RemoveInput", result=False, code=600, comment="nope")])
+    c = WSClient(host="x", port=1)
+    c._ws = fake
+    reconnects: list[int] = []
+    monkeypatch.setattr(c, "connect", lambda: reconnects.append(1))
+    with pytest.raises(OBSError):
+        c.request("RemoveInput", {"inputName": "ghost"})
+    assert len(fake.sent) == 1   # sent exactly once
+    assert reconnects == []       # never tried to reconnect
+
+
+# --------------------------------------------------------------------------- #
 # client.py — the three bugs fixed after live QA against real OBS hardware:     #
 #   1. device-id resolution (camera bound by name -> never opened, 0x0)         #
 #   2. camera-streaming verification (no more false "scene ready")              #
 #   3. stop_recording polls for the finalized camera file (was a 1.5s race)     #
+# Plus the OBS reliability fixes: best-effort probe teardown + orphan sweep.     #
 # --------------------------------------------------------------------------- #
 
 def _bare_client():
@@ -402,6 +443,83 @@ def test_stop_recording_returns_null_camera_when_none_written(tmp_path):
     c.req = lambda t, d=None: {"outputPath": "C:/screen.mp4"}
     out = c.stop_recording(timeout=1.0)  # no camera_* file appears
     assert out["camera"] is None
+
+
+def test_ensure_absent_does_not_raise_on_slow_teardown():
+    # An input that never disappears (slow display-capture teardown) must NOT raise --
+    # this was the "did not tear down within 5.0s" hang that blocked setup_scene.
+    c = _bare_client()
+    c.req = lambda t, d=None: ({"inputs": [{"inputName": "stuck"}]} if t == "GetInputList" else {})
+    assert c._ensure_absent("stuck", timeout=0.3) is None
+
+
+def test_sweep_probes_removes_only_probe_inputs():
+    c = _bare_client()
+    removed: list[str] = []
+    inputs = [{"inputName": "Screen"},
+              {"inputName": "__dopestclip_probe_monitor_capture_3"},
+              {"inputName": "Camera"}]
+
+    def req(t, d=None):
+        if t == "GetInputList":
+            return {"inputs": inputs}
+        if t == "RemoveInput":
+            removed.append(d["inputName"])
+            return {}
+        return {}
+    c.req = req
+    c._sweep_probes()
+    assert removed == ["__dopestclip_probe_monitor_capture_3"]
+
+
+def test_ensure_input_recreates_when_input_missing_from_scene():
+    # Input exists globally (right device) but is NOT in this scene (GetSceneItemId 600,
+    # e.g. it lingered from a renamed old scene). Must remove + recreate, not crash on 600.
+    from dopest_clip.obs.ws import OBSError
+    c = _bare_client()
+    present = {"Screen": True}
+    calls: list[str] = []
+
+    def req(t, d=None):
+        calls.append(t)
+        if t == "GetInputList":
+            return {"inputs": [{"inputName": "Screen"}] if present["Screen"] else []}
+        if t == "GetInputSettings":
+            return {"inputSettings": {"monitor_id": "MON"}}
+        if t == "GetSceneItemId":
+            raise OBSError("GetSceneItemId failed [600]: no scene items")
+        if t == "RemoveInput":
+            present["Screen"] = False
+            return {}
+        if t == "CreateInput":
+            return {"sceneItemId": 7}
+        return {}
+    c.req = req
+    sid, created = c._ensure_input(
+        "DopestClipRec", "Screen", "monitor_capture", "monitor_id", "MON", {"monitor_id": "MON"})
+    assert (sid, created) == (7, True)
+    assert "CreateInput" in calls   # recreated into this scene instead of 600-crashing
+
+
+def test_ensure_input_reuses_when_in_scene_with_matching_device():
+    # Already in this scene with the right device -> reuse, never recreate (no device reopen).
+    c = _bare_client()
+    calls: list[str] = []
+
+    def req(t, d=None):
+        calls.append(t)
+        if t == "GetInputList":
+            return {"inputs": [{"inputName": "Screen"}]}
+        if t == "GetInputSettings":
+            return {"inputSettings": {"monitor_id": "MON"}}
+        if t == "GetSceneItemId":
+            return {"sceneItemId": 3}
+        return {}
+    c.req = req
+    sid, created = c._ensure_input(
+        "DopestClipRec", "Screen", "monitor_capture", "monitor_id", "MON", {"monitor_id": "MON"})
+    assert (sid, created) == (3, False)
+    assert "CreateInput" not in calls and "RemoveInput" not in calls
 
 
 # --------------------------------------------------------------------------- #

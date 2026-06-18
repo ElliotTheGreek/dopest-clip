@@ -63,15 +63,28 @@ the screen with full control (position, scale, keyframes, background removal).
 - compose_camera(...) — animate the camera over the FULL screen master (+ clip-art
   overlays + blur); list_graphics() shows overlay kinds (arrow/ring/box/label) — you can
   also pass a custom inline svg or a transparent PNG (e.g. a generated lightbulb).
-- mix_camera(edl_id, camera_path, keyframes=…, remove_background=True) — composite the
-  cut-synced, background-removed camera over the CUT screen with an animated rect
-  (keyframes/presets: fullscreen/center/pip/top-left/…); GPU matte (RVM+NVENC) when CUDA
-  is present, CPU rembg fallback otherwise.
-- get_cut_transcript(edl_id) — the cut-timeline word indices to design shorts on.
-- make_short(edl_id, from_word, to_word, hook_title, screen_keyframes=…) — render a 9:16
-  SHORT: hook + karaoke captions TOP, screen (optional per-frame zoom) MIDDLE,
-  background-removed person BIG at the BOTTOM. Needs render() + mix_camera(remove_background=True)
-  first (it reuses the cached matte). GPU/NVENC.
+- mix_camera(edl_id, camera_path, keyframes=…, remove_background=True, overlays=…, blurs=…,
+  screen_keyframes=…, bg_visible_until=…) — the UNIFIED GPU compose-over-cut. One GPU pass
+  (RVM+NVENC; CPU rembg fallback) over the CUT screen: animated camera rect (presets
+  fullscreen/center/pip/top-left/… = make-me-big / corner / slide) + `overlays` (arrow/ring/
+  box/label, inline `svg`, or transparent `image` PNG) + `blurs` (animated blur; `invert:true`
+  = blur everything BUT the shape = "blur all but my face") + `screen_keyframes` (crop+zoom
+  the screen, e.g. into a button) + `bg_visible_until` (keep the FULL camera background visible
+  until that second, then drop to a cutout). All times are CUT-timeline seconds.
+- get_cut_transcript(edl_id) — the cut-timeline word indices/times to drive shorts AND to time
+  every mix_camera effect (overlays/zooms/bg-drop land on the right spoken moments after cuts).
+- make_short(edl_id, from_word, to_word, hook_title, screen_keyframes=…, overlays=…) — render a
+  9:16 SHORT: hook + karaoke captions TOP, screen (optional per-frame zoom) MIDDLE, background-
+  removed person BIG at the BOTTOM, with optional graphic overlays on top. Needs render() +
+  mix_camera(remove_background=True) first (reuses the cached matte). GPU/NVENC.
+
+## Long renders: drive them async over MCP (never block the tool call)
+A real-length matte+composite takes minutes — too long for one synchronous tool call. So
+run any render through the job surface: start_render(operation, params) returns a job_id
+immediately (operation = "mix_camera"|"make_short"|"render"|"compose_camera"|"verify_clip",
+params = that op's kwargs); poll render_status(job_id) until status == "done" (its `result`
+holds the op's return) or "error". list_render_jobs() shows all jobs. The matte is cached, so
+re-running a mix_camera composite (tweaking overlays/positions) is quick.
 
 ## Talking-head short, end to end
 record → create_project(SCREEN) → transcribe → design+render an EDL → mix_camera(edl_id,
@@ -79,10 +92,10 @@ camera_path, remove_background=True) (builds the GPU matte) → get_cut_transcri
 make_short(edl_id, from_word, to_word, hook_title). Matte the SHORT, not the long form, as
 a first proof (see learn://gotchas for matte speed + the compose-CPU vs mix-GPU split).
 
-## Clip-art / graphic overlays (compose_camera only)
-Overlays animate over the FULL screen master via compose_camera(overlays=[…]); make_short
-does NOT take overlays. Each overlay is {"image": "transparent.png"} OR {"svg": "<inline>"}
-OR a built-in kind (see list_graphics), plus: anchor [ax,ay] (the point on the graphic
+## Clip-art / graphic overlays
+Overlays work in mix_camera (over the CUT, GPU), make_short (over the 9:16 short), AND
+compose_camera (over the FULL uncut master, CPU). Each overlay is {"image": "transparent.png"}
+OR {"svg": "<inline>"} OR a built-in kind (see list_graphics), plus: anchor [ax,ay] (the point on the graphic
 placed at pos), keyframes [{t, pos:[nx,ny], scale, ease}] (t is LOCAL to t_in), and
 t_in/t_out/fade/opacity. Time a pop to a spoken word: read that word's start/end from
 transcript.json and set t_in just before it (a scale 0.05→0.14→0.11 keyframe = a pop).

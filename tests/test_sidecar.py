@@ -59,3 +59,69 @@ def test_rpc_operation_error_is_structured(server):
     # validate_edl on a missing project returns an error dict, not a crash
     out = _rpc(server, "list_projects")
     assert out["ok"] and "projects" in out["result"]
+
+
+# --- error routes + shaping (full control-path coverage) ------------------------------
+
+import urllib.error  # noqa: E402
+
+
+def _get_raw(url):
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def _post_raw(base, path, raw_body):
+    req = urllib.request.Request(base + path, data=raw_body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_get_unknown_route_404(server):
+    code, body = _get_raw(server + "/nope")
+    assert code == 404 and body["ok"] is False and "no route" in body["error"]
+
+
+def test_post_non_rpc_route_404(server):
+    code, body = _post_raw(server, "/nope", b"{}")
+    assert code == 404 and "no route" in body["error"]
+
+
+def test_post_bad_body_400(server):
+    code, body = _post_raw(server, "/rpc", b"not json at all")
+    assert code == 400 and "bad request body" in body["error"]
+
+
+def test_post_params_not_object_400(server):
+    code, body = _post_raw(server, "/rpc", json.dumps({"method": "list_providers", "params": [1, 2]}).encode())
+    assert code == 400 and "params must be an object" in body["error"]
+
+
+def test_rpc_bad_params_typeerror_400(server):
+    # get_project requires project_id; omitting it -> TypeError -> 400
+    code, body = _post_raw(server, "/rpc", json.dumps({"method": "get_project", "params": {}}).encode())
+    assert code == 400 and "bad params for get_project" in body["error"]
+
+
+def test_rpc_operation_exception_is_structured_200(server):
+    # mix_camera on a missing project raises FileNotFoundError -> caught -> 200 ok:false
+    code, body = _post_raw(server, "/rpc", json.dumps(
+        {"method": "mix_camera", "params": {"project_id": "nope", "edl_id": "x", "camera_path": "y"}}).encode())
+    assert code == 200 and body["ok"] is False and ":" in body["error"]
+
+
+def test_serve_block_true_prints_then_serves(monkeypatch):
+    from dopest_clip import sidecar as sc
+    ran = {}
+    monkeypatch.setattr(sc.ThreadingHTTPServer, "serve_forever", lambda self: ran.setdefault("ran", True))
+    httpd = sc.serve("127.0.0.1", 0, block=True)
+    try:
+        assert ran.get("ran") is True
+    finally:
+        httpd.server_close()

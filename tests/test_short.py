@@ -169,3 +169,57 @@ def test_mix_raw_inset_when_no_background_removal(monkeypatch, mix_project):
     info = camera_mix.mix(pid, eid, cam, remove_background=False)
     assert info["matte_backend"] == "raw-inset"
     assert info["background_removed"] is False
+
+
+# --- unified GPU compose: effect params route to composite_gpu ------------------------
+
+def test_mix_routes_full_effect_stack_to_gpu_composite(monkeypatch, mix_project):
+    """overlays / blurs / screen_keyframes / bg_visible_until all flow through to the GPU
+    composite, with the un-matted cut camera passed for the bg-visible phase."""
+    pid, eid, cam = mix_project
+    captured = {}
+    monkeypatch.setattr(camera_mix, "_resolve_segments", lambda p, e: [(0.0, 1.0)])
+    monkeypatch.setattr(camera_mix, "cut_video_only", lambda *a, **k: None)
+    monkeypatch.setattr(camera_mix, "rvm_matte", lambda *a, **k: None)
+    monkeypatch.setattr(camera_mix, "composite_gpu",
+                        lambda *a, **k: captured.update(k) or {"output": "o", "size": [1, 1], "duration": 1.0})
+    monkeypatch.setattr(camera_mix, "_cuda_available", lambda: True)
+
+    info = camera_mix.mix(
+        pid, eid, cam, remove_background=True,
+        overlays=[{"kind": "ring", "keyframes": [{"t": 0, "pos": [0.5, 0.5], "scale": 0.1}]}],
+        blurs=[{"shape": "circle", "keyframes": [{"t": 0, "pos": [0.5, 0.5], "scale": 0.3}]}],
+        screen_keyframes=[{"t": 0, "zoom": 1.0, "focus": [0.5, 0.5]}],
+        bg_visible_until=3.0)
+    assert info["matte_backend"] == "rvm-gpu"
+    assert captured["overlays"] and captured["blurs"] and captured["screen_keyframes"]
+    assert captured["bg_visible_until"] == 3.0
+    assert captured["cut_cam_path"]   # un-matted cut camera passed for the bg-visible phase
+
+
+def test_mix_bg_toggle_alone_uses_gpu(monkeypatch, mix_project):
+    pid, eid, cam = mix_project
+    seen = {}
+    monkeypatch.setattr(camera_mix, "_resolve_segments", lambda p, e: [(0.0, 1.0)])
+    monkeypatch.setattr(camera_mix, "cut_video_only", lambda *a, **k: None)
+    monkeypatch.setattr(camera_mix, "rvm_matte", lambda *a, **k: None)
+    monkeypatch.setattr(camera_mix, "composite_gpu",
+                        lambda *a, **k: seen.update(k) or {"output": "o", "size": [1, 1], "duration": 1.0})
+    monkeypatch.setattr(camera_mix, "_cuda_available", lambda: True)
+    info = camera_mix.mix(pid, eid, cam, remove_background=False, bg_visible_until=2.0)
+    assert info["matte_backend"] == "rvm-gpu"   # an effect forces GPU compose even w/o remove_background
+    assert seen["bg_visible_until"] == 2.0
+
+
+def test_prep_overlays_rasterizes_kind_and_defaults(projects_root):
+    prepped = camera_mix._prep_overlays(
+        [{"kind": "ring", "color": "#ff0000", "keyframes": [{"t": 0, "pos": [0.5, 0.5], "scale": 0.1}]}], 1920)
+    assert len(prepped) == 1
+    o = prepped[0]
+    assert o["arr"].ndim == 3 and o["arr"].shape[2] == 4   # HxW RGBA
+    assert o["t_out"] is None and o["anchor"] == [0.5, 0.5]
+
+
+def test_prep_overlays_empty_is_noop():
+    assert camera_mix._prep_overlays(None, 1920) == []
+    assert camera_mix._prep_overlays([], 1920) == []

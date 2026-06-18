@@ -26,5 +26,5 @@ def main(argv: list[str] | None = None) -> None:
         server.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

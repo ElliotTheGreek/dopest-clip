@@ -29,12 +29,17 @@ from __future__ import annotations
 
 import dataclasses
 import glob
+import itertools
 import os
 import time
 from typing import Any
 
 from .. import config
 from .ws import OBSError, WSClient
+
+# Per-process counter for unique probe-input names (see list_devices). A unique name per
+# call means a slow-to-tear-down probe from a prior call never collides with this one.
+_probe_counter = itertools.count(1)
 
 KIND_MONITOR = "monitor_capture"
 KIND_CAMERA = "dshow_input"
@@ -90,8 +95,10 @@ class OBSClient:
     # -- device enumeration -------------------------------------------------
     def list_devices(self, kind: str) -> list[Device]:
         prop = DEVICE_PROP[kind]
-        tmp = f"__dopestclip_probe_{kind}"
-        self._ensure_absent(tmp)
+        # Unique probe name per call: CreateInput can never collide (601) with a probe
+        # from a previous call that OBS is still tearing down, so a slow display-capture
+        # teardown never blocks enumeration. Cleanup is best-effort (teardown is async).
+        tmp = f"__dopestclip_probe_{kind}_{next(_probe_counter)}"
         self.req("CreateInput", {
             "sceneName": self._first_scene(), "inputName": tmp,
             "inputKind": kind, "inputSettings": {}, "sceneItemEnabled": False,
@@ -100,7 +107,7 @@ class OBSClient:
             items = self.req("GetInputPropertiesListPropertyItems",
                              {"inputName": tmp, "propertyName": prop}).get("propertyItems", [])
         finally:
-            self._ensure_absent(tmp)
+            self._remove_input_quiet(tmp)
         out: list[Device] = []
         for it in items:
             val = it.get("itemValue")
@@ -179,6 +186,7 @@ class OBSClient:
         and it stops producing frames. We only (re)create an input when it is missing
         or its device changed, so the camera opens at most once per device choice.
         """
+        self._sweep_probes()  # clear any probe inputs orphaned by an interrupted earlier call
         self._ensure_scene(scene_name)
 
         # Resolve each identifier (a friendly NAME or a device_id) to the exact device_id
@@ -252,20 +260,41 @@ class OBSClient:
             "camera_streaming": streaming,
         }
 
+    def _scene_item_id(self, scene: str, name: str) -> int | None:
+        """sceneItemId of `name` IN `scene`, or None if the input is not in that scene
+        (GetSceneItemId raises 600 then). Distinguishes 'input exists globally' from
+        'input is placed in this scene' -- they differ after a scene rename / OBS restart
+        where the old inputs linger but the new scene is empty."""
+        try:
+            return self.req("GetSceneItemId",
+                            {"sceneName": scene, "sourceName": name})["sceneItemId"]
+        except OBSError:
+            return None
+
     def _ensure_input(self, scene: str, name: str, kind: str, dev_key: str,
                       dev_val: str, settings: dict[str, Any]) -> tuple[int, bool]:
-        """Create the input, or reuse it untouched if it already exists with the same
-        device. Returns (sceneItemId, created). Reuse avoids reopening the device."""
+        """Create the input in THIS scene, or reuse it untouched if it already exists in
+        THIS scene with the same device. Returns (sceneItemId, created). Reuse avoids
+        reopening the device; recreation is the path when the input is missing from this
+        scene (e.g. it lingered from an old/renamed scene) or its device changed."""
         if name in self._input_names():
             cur = self.req("GetInputSettings", {"inputName": name}).get("inputSettings", {})
-            if cur.get(dev_key) == dev_val:
-                sid = self.req("GetSceneItemId",
-                               {"sceneName": scene, "sourceName": name})["sceneItemId"]
-                return sid, False
-            self._ensure_absent(name)  # device changed -> one controlled reopen
-        r = self.req("CreateInput", {
-            "sceneName": scene, "inputName": name, "inputKind": kind,
-            "inputSettings": settings, "sceneItemEnabled": True})
+            sid = self._scene_item_id(scene, name)
+            if sid is not None and cur.get(dev_key) == dev_val:
+                return sid, False  # correct device AND already in this scene -> reuse, no reopen
+            # wrong device, or the input exists only in another scene -> remove + recreate here
+            self._ensure_absent(name)
+        try:
+            r = self.req("CreateInput", {
+                "sceneName": scene, "inputName": name, "inputKind": kind,
+                "inputSettings": settings, "sceneItemEnabled": True})
+        except OBSError as e:  # 601 = a same-named input is still tearing down; wait + retry once
+            if "601" not in str(e):
+                raise
+            self._ensure_absent(name, timeout=8.0)
+            r = self.req("CreateInput", {
+                "sceneName": scene, "inputName": name, "inputKind": kind,
+                "inputSettings": settings, "sceneItemEnabled": True})
         return r["sceneItemId"], True
 
     def _ensure_source_record(self, source_name: str, record_dir: str) -> bool:
@@ -392,19 +421,40 @@ class OBSClient:
         if name not in self._scene_names():
             self.req("CreateScene", {"sceneName": name})
 
+    def _remove_input_quiet(self, input_name: str) -> None:
+        """Best-effort RemoveInput: fire it and move on, swallowing errors. Teardown is
+        async; a leftover disabled, off-canvas probe input is harmless and gets swept on
+        the next build_scene. Used for throwaway probe inputs."""
+        try:
+            self.req("RemoveInput", {"inputName": input_name})
+        except OBSError:
+            pass
+
+    def _sweep_probes(self) -> None:
+        """Remove any probe inputs orphaned by an interrupted or slow earlier call."""
+        try:
+            names = self._input_names()
+        except OBSError:
+            return
+        for n in names:
+            if n.startswith("__dopestclip_probe"):
+                self._remove_input_quiet(n)
+
     def _ensure_absent(self, input_name: str, timeout: float = 5.0) -> None:
         if input_name not in self._input_names():
             return
-        self.req("RemoveInput", {"inputName": input_name})
-        # active capture devices (camera/mic/display) tear down asynchronously
-        # (~100-200ms measured); wait for the source to actually disappear before
-        # callers recreate a same-named input, else CreateInput hits 601.
+        self._remove_input_quiet(input_name)
+        # Active capture devices (camera/mic/display) tear down asynchronously; wait
+        # best-effort for the source to disappear before a same-named recreate (avoids
+        # CreateInput 601 / the DShow reopen race). A slow teardown must NOT be fatal --
+        # if it outlasts the timeout we return and let the caller proceed rather than
+        # failing the whole operation (this was the "did not tear down within 5s" hang).
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if input_name not in self._input_names():
                 return
             time.sleep(0.1)
-        raise OBSError(f"Input {input_name!r} did not tear down within {timeout}s.")
+        return
 
 
 # --- env-driven connection config + public plain functions ------------------

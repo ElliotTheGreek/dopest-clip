@@ -105,6 +105,12 @@ Read the `learn://` resources before driving it. Start with `learn://overview`, 
 
 The Electron app in `desktop/` runs the same core as a localhost sidecar (`python -m dopest_clip --serve`) and edits the same project files. The renderer never talks to the network itself; the main process proxies the sidecar.
 
+![The dopest-clip editor: projects, the word-indexed transcript, the EDL timeline, the inspector, and the preview panel](docs/img/editor/editor-overview.png)
+
+It is transcript-first. You select word ranges to build the edit; there is no scrub bar on the raw source. The player fills in with the rendered output after you Render, Mix camera, or Make short (it streams the result), and Grab frame pulls a still from the source.
+
+![The preview player showing a rendered cut, with the provider registry one tab over](docs/img/editor/editor-player.png)
+
 ```bash
 cd desktop
 npm install

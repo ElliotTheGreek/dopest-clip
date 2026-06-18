@@ -26,12 +26,18 @@ def compose(
     max_duration: float | None = None,
     overlays: list[dict[str, Any]] | None = None,
     blurs: list[dict[str, Any]] | None = None,
+    bg_visible_until: float | None = None,
 ) -> dict[str, Any]:
     """Render screen + animated camera (+ optional animated graphic overlays + blur
     effects) -> output_path. ``keyframes`` is the raw camera timeline (presets
     allowed). ``overlays`` is a list of animated graphic specs (see _build_overlay).
     ``blurs`` is a list of animated screen blur specs (see blur.make_processor).
-    ``max_duration`` optionally caps the output length. Returns output info."""
+    ``max_duration`` optionally caps the output length. Returns output info.
+
+    NOTE: ``bg_visible_until`` (mid-clip background drop) is honored only by the GPU
+    composite path (camera_mix.composite_gpu); this CPU fallback mattes the whole clip
+    when remove_background is set (moviepy's clip-local time makes a per-time matte toggle
+    unreliable). On a CUDA box the GPU path is used and the toggle works."""
     for p, label in ((screen_path, "screen"), (camera_path, "camera")):
         if not os.path.isfile(p):
             raise FileNotFoundError(f"{label} file not found: {p}")

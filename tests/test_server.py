@@ -33,3 +33,16 @@ def test_resource_bodies_are_distinct():
     # the closure-per-body fix: each resource returns its own text, not the last one
     bodies = set(learn.RESOURCES.values())
     assert len(bodies) == len(learn.RESOURCES)
+
+
+def test_read_resource_returns_its_body():
+    # reading a resource invokes the registered closure (covers the per-body return path)
+    res = asyncio.run(server.mcp.read_resource("learn://overview"))
+    assert res and "dopest-clip" in str(res)
+
+
+def test_run_invokes_mcp_run(monkeypatch):
+    ran = {}
+    monkeypatch.setattr(server.mcp, "run", lambda: ran.setdefault("ran", True))
+    server.run()
+    assert ran["ran"] is True

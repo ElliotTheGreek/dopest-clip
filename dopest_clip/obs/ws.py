@@ -38,6 +38,18 @@ def _import_websocket():
     return websocket
 
 
+def _transport_errors() -> tuple[type[BaseException], ...]:
+    """Exception types that mean the SOCKET died (vs an OBS logical error). OSError
+    covers WinError 10053 / ConnectionAbortedError; websocket-client's WebSocketException
+    covers a closed connection. A failed-request OBSError is a RuntimeError and is NOT in
+    here, so it is never mistaken for a transport drop and retried."""
+    try:
+        import websocket
+        return (OSError, websocket.WebSocketException)
+    except ImportError:
+        return (OSError,)
+
+
 class WSClient:
     def __init__(self, host: str = "localhost", port: int = 4455,
                  password: str | None = None, timeout: float = 5.0):
@@ -90,6 +102,23 @@ class WSClient:
         return self._ws
 
     def request(self, req_type: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Send a request and return its responseData. If the socket has died (e.g. OBS
+        was restarted -> WinError 10053), drop it, reconnect, and retry ONCE so a restarted
+        OBS heals automatically. A logical failure (result:false -> OBSError) is NOT a
+        transport error and is never retried."""
+        transport = _transport_errors()
+        try:
+            return self._do_request(req_type, data)
+        except transport:
+            self.close()  # drop the dead socket; the `ws` property reconnects lazily
+            try:
+                return self._do_request(req_type, data)
+            except transport as e2:  # noqa: BLE001
+                raise OBSError(
+                    f"OBS websocket connection lost and reconnect failed: {e2}"
+                ) from e2
+
+    def _do_request(self, req_type: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         self._id += 1
         rid = f"r{self._id}"
         payload: dict[str, Any] = {"op": 6, "d": {"requestType": req_type, "requestId": rid}}

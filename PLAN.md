@@ -31,11 +31,57 @@
 > `asNames()` coercion. Also added a fatal-error catcher in `main.tsx` so a boot throw
 > shows in-window instead of a blank screen.
 >
-> **NEXT (after restart):** live QA on the `captest1` recording across BOTH faces — via MCP
-> (re-cut with GPU cutout + featured 9:16 short + a clip-art overlay timed to "idea" + animated
-> camera keyframes) and via the editor (drive the full pipeline through electron-qa). Remaining
-> v2 polish: native file-picker, graphical keyframe-curve UI, audio/image editor panels,
-> FlowDot provider endpoint specifics.
+## REMAINING WORK — full parity + the live demo (2026-06-18)
+
+A real recorded demo (`projects/demo1`, a 4.5-min take with ~10 spoken effect requests) is the
+acceptance test. GOAL: **100% parity with the old obs-mcp + short-form-editor combo — every
+effect re-implemented properly and tested.** No corner-cutting.
+
+**Where we actually stand (evidence-based audit of obs-mcp vs dopest_clip):** dopest-clip already
+holds the old combo's full FEATURE set — `compose_camera` does graphic overlays (arrow/ring/box/
+label/inline-svg/image-PNG) + animated blur including **focus-region via `invert`** (this IS
+"blur everything but my face") + camera keyframe moves (big/corner/slide presets) + CPU rembg
+matte; `make_short`/`vertical_clip` does GPU screen-zoom + karaoke captions + person-bottom 9:16;
+`mix_camera` does GPU RVM+NVENC matte over the cut; EDL cut/transcript/reframe/verify all present.
+The old `obs-mcp` `compose_camera` was ALSO CPU-matte with no screen-zoom, so those were never
+parity gaps. Every effect the demo asks for (lightbulb, kitten place+remove, arrows, circle-on-
+face=ring, blur-bg, blur-all-but-face=invert blur, big/corner/slide, captioned cutout-bottom short)
+is expressible with TODAY's tools.
+
+**What's genuinely unfinished (the real work):** making the full effect stack run **fast (GPU) over
+the CUT, in one pass** — neither old nor new does this (old combo had GPU-matte in `mix_camera` OR
+overlays in `compose_camera`, never both; CPU `compose_camera` on a 4-min clip is far too slow).
+
+### Tasks
+1. **Unified GPU compose-over-cut** (centerpiece). Extend the GPU composite path
+   (`obs/camera_mix.py` `composite_gpu`, reusing the cached RVM fgr/pha) so a single render over
+   the CUT screen + cut-synced camera applies, on the GPU with NVENC: camera keyframes (have it) +
+   **graphic overlays** + **animated blur incl. focus-region** + **screen zoom** (`timeline.
+   sample_screen`, port from `vertical_clip`). Expose via `mix_camera` gaining `overlays`, `blurs`,
+   `screen_keyframes` params (or a new `compose_cut` op). This is what makes the demo feasible.
+2. **Mid-clip background toggle** — background VISIBLE then removed at a cue ("enter dopest clip").
+   Add a time-gated matte to the GPU compose (opaque camera before t_cue, RVM alpha after), or a
+   clean two-phase render + concat. New (old combo lacked it).
+3. **Effect timing on the CUT timeline** — effect `t` values key off the cut-timeline word times
+   (`get_cut_transcript` / `edl.remap_to_output_timeline`), so overlays/zooms land on the right
+   spoken moments after cuts remove sections.
+4. **make_short overlays** — add an `overlays` param to `vertical_clip` (arrows/labels in shorts).
+5. **Asset prep helpers** — generate transparent PNGs (kitten, lightbulb) via the image provider +
+   `image_remove_background`; locate hand/face position from `grab_frame` to place them.
+6. **CPU fallback stays correct** — `compose_camera` (CPU rembg) remains for no-GPU boxes; same
+   effect API, just slower. Parity does not depend on a GPU.
+
+### Acceptance / verification (against `projects/demo1`)
+- Long-form (16:9): clean cut (remove the 4 "cut"-marked fumbles) + GPU cutout from "enter dopest
+  clip" + lightbulb at "then I had an idea" + kitten place/remove + circle-on-face + blur-all-but-
+  face + make-me-big + corner/slide + arrows on pointed items — rendered fast, verified by frames.
+- Short-form (9:16): a compelling segment via `make_short` (captions top / screen-zoom mid / cutout
+  bottom) with arrows.
+- Both added near the top of the README. Unit tests for every new GPU-compose path.
+- Screen-zoom-into-the-record-button in LONG-form is delivered by Task 1's screen-zoom-over-cut.
+
+> Earlier v2 polish (deferred, not parity): native file-picker, graphical keyframe-curve editor UI,
+> audio/image editor panels, FlowDot provider endpoint specifics.
 
 ## Context
 
