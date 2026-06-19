@@ -261,6 +261,67 @@ def test_segment_at_last_overlapping_wins():
     assert camera_mix._segment_at(segs, 7.0) == "/b.png"             # later segment overrides
 
 
+def test_bg_mode_at_window_wins_else_falls_back():
+    from dopest_clip.obs import camera_mix
+    wins = [{"start": 74.0, "end": 78.0, "mode": "/bg/window.png"},
+            {"start": 78.0, "end": 85.0, "mode": "/bg/shelves.png"},
+            {"start": 103.0, "end": 122.0, "mode": "screen"}]
+    # covered windows win
+    assert camera_mix._bg_mode_at(wins, 75.0, 283.0) == "/bg/window.png"
+    assert camera_mix._bg_mode_at(wins, 84.999, 283.0) == "/bg/shelves.png"
+    assert camera_mix._bg_mode_at(wins, 110.0, 283.0) == "screen"
+    # uncovered -> bg_visible_until rule: real before it, screen after
+    assert camera_mix._bg_mode_at(wins, 50.0, 283.0) == "real"
+    assert camera_mix._bg_mode_at(wins, 300.0, 283.0) == "screen"
+    # exclusive end / inclusive start boundaries
+    assert camera_mix._bg_mode_at(wins, 78.0, 283.0) == "/bg/shelves.png"
+    assert camera_mix._bg_mode_at(wins, 85.0, 283.0) == "real"
+
+
+def test_bg_mode_at_last_window_overrides_and_default_screen():
+    from dopest_clip.obs import camera_mix
+    wins = [{"start": 0.0, "end": 10.0, "mode": "real"},
+            {"start": 5.0, "end": 10.0, "mode": "screen"}]
+    assert camera_mix._bg_mode_at(wins, 7.0, None) == "screen"   # later window overrides
+    # no windows, no bg_visible_until -> legacy default is the cutout-over-screen
+    assert camera_mix._bg_mode_at(None, 7.0, None) == "screen"
+    assert camera_mix._bg_mode_at([], 7.0, 12.0) == "real"       # within bg_visible_until
+
+
+def test_pick_pauses_filters_and_spreads():
+    from dopest_clip.obs import camera_mix
+    sils = [{"start": float(i), "end": float(i) + d, "dur": d}
+            for i, d in enumerate([0.2, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 1.5])]
+    # genuine dead-air gaps: dur >= 0.5 keeps the six 0.6s + the 1.5s = 7 (the 0.2 is dropped)
+    elig = camera_mix._pick_pauses(sils, count=10, min_dur=0.5)
+    assert len(elig) == 7 and all(s["dur"] >= 0.5 for s in elig)
+    # capped + spread across the eligible set (not just the first N)
+    picked = camera_mix._pick_pauses(sils, count=3, min_dur=0.5)
+    assert len(picked) == 3
+    assert [p["start"] for p in picked] == [1.0, 3.0, 5.0]   # indices 0,2,4 of the 7 eligible
+    assert camera_mix._pick_pauses(sils, count=0, min_dur=0.5) == elig
+
+
+def test_compute_track_cache_invalidated_when_video_newer(tmp_path):
+    pytest.importorskip("cv2")
+    import json
+    import os
+    from dopest_clip.obs import tracking
+    vid = tmp_path / "v.mp4"
+    vid.write_bytes(b"not a real video")
+    cache = tmp_path / "track.json"
+    cached = [{"t": 0.0, "x": 0.5, "y": 0.5, "w": 0.1, "h": 0.1}]
+    cache.write_text(json.dumps({"target": "face", "track": cached}), encoding="utf-8")
+    # cache NEWER than the video -> trusted, returned without re-detecting
+    os.utime(vid, (1000, 1000))
+    os.utime(cache, (2000, 2000))
+    assert tracking.compute_track(str(vid), "face", cache_path=str(cache)) == cached
+    # video NEWER than the cache (it was re-cut) -> stale, recomputed (dummy video -> empty track)
+    os.utime(vid, (3000, 3000))
+    os.utime(cache, (2000, 2000))
+    assert tracking.compute_track(str(vid), "face", cache_path=str(cache)) == []
+
+
 def test_cover_to_dimensions_and_no_distortion():
     pytest.importorskip("cv2")
     import numpy as np

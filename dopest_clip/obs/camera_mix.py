@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Any
 
 from .. import config, edl as edlmod, project
@@ -327,12 +328,31 @@ def _paste_overlays_gpu(canvas_hw3, prepped, t: float, fw: int, fh: int, duratio
     return canvas_hw3
 
 
+def _bg_mode_at(backgrounds: list[dict[str, Any]] | None, t: float,
+                bg_visible_until: float | None) -> str:
+    """Resolve the background mode at cut-time t. A window in `backgrounds` covering t wins
+    (last one covering t, so later windows override earlier); otherwise fall back to the
+    bg_visible_until rule ('real' while t < bg_visible_until, else 'screen'). Returns a mode:
+    'real'/'camera' (full un-matted camera), 'screen' (cutout over the cut screen), or an
+    image path (cutout over that cover-fit still). Pure."""
+    mode = None
+    for w in (backgrounds or []):
+        if float(w["start"]) <= t < float(w["end"]):
+            mode = w.get("mode", "real")
+    if mode is not None:
+        return mode
+    if bg_visible_until is not None and t < float(bg_visible_until):
+        return "real"
+    return "screen"
+
+
 def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                   keyframes: list[dict[str, Any]], out_path: str, *,
                   cut_cam_path: str | None = None, overlays: list[dict[str, Any]] | None = None,
                   blurs: list[dict[str, Any]] | None = None,
                   screen_keyframes: list[dict[str, Any]] | None = None,
-                  bg_visible_until: float | None = None) -> dict[str, Any]:
+                  bg_visible_until: float | None = None,
+                  backgrounds: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """GPU composite (torch/CUDA + NVENC): per-frame screen-zoom -> screen blur/focus ->
     camera over screen (matted cutout, OR full opaque camera while t < bg_visible_until for
     a mid-clip background drop) -> graphic overlays on top. Every effect is optional and
@@ -344,7 +364,11 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
     cap_s = cv2.VideoCapture(screen_path)
     cap_f = cv2.VideoCapture(fgr_path)
     cap_p = cv2.VideoCapture(pha_path)
-    cap_c = cv2.VideoCapture(cut_cam_path) if (cut_cam_path and bg_visible_until is not None) else None
+    # the un-matted camera is needed for any 'real'/'camera' background window (or the legacy
+    # bg_visible_until phase). Image/'screen' windows only need the matte (fgr/pha).
+    needs_cam = (bg_visible_until is not None) or any(
+        w.get("mode", "real") in ("real", "camera") for w in (backgrounds or []))
+    cap_c = cv2.VideoCapture(cut_cam_path) if (cut_cam_path and needs_cam) else None
     fps = cap_s.get(cv2.CAP_PROP_FPS) or 30.0
     fw = int(cap_s.get(cv2.CAP_PROP_FRAME_WIDTH))
     fh = int(cap_s.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -368,6 +392,16 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
         s2["_track"] = _compute_track(s.get("track"), screen_path, cut_cam_path, cache_dir)
         blur_specs.append(s2)
     prepped = _prep_overlays(overlays, fw, screen_path=screen_path, cam_path=cut_cam_path, cache_dir=cache_dir)
+    # preload any image-mode background windows, cover-fit to the frame (cutout composites over them)
+    bg_tensors: dict[str, Any] = {}
+    for w in (backgrounds or []):
+        m = w.get("mode", "real")
+        if m not in ("real", "camera", "screen") and m not in bg_tensors:
+            bgi = cv2.imread(m, cv2.IMREAD_COLOR)
+            if bgi is None:
+                raise ValueError(f"could not read background image: {m}")
+            bg_tensors[m] = torch.from_numpy(
+                cv2.cvtColor(_cover_to(bgi, fw, fh), cv2.COLOR_BGR2RGB)).to("cuda").float()
     os.makedirs(cache_dir, exist_ok=True)
 
     proc = subprocess.Popen(
@@ -408,9 +442,9 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                     x, y, w, h = tracking.apply_track_to_rect((x, y, w, h), cam_track, t, fw, fh)
                 x0, y0 = max(0, x), max(0, y)
                 x1, y1 = min(fw, x + w), min(fh, y + h)
-                bg_visible = (bg_visible_until is not None) and (t < float(bg_visible_until))
-                if bg_visible and cfrm is not None:
-                    # background-visible phase: composite the FULL un-matted camera, opaque
+                mode = _bg_mode_at(backgrounds, t, bg_visible_until)
+                if mode in ("real", "camera") and cfrm is not None:
+                    # real-background phase: composite the FULL un-matted camera, opaque
                     cam = (torch.from_numpy(cv2.cvtColor(cfrm, cv2.COLOR_BGR2RGB)).to(dev).float()
                            .permute(2, 0, 1).unsqueeze(0))
                     cam_r = torch.nn.functional.interpolate(
@@ -419,6 +453,9 @@ def composite_gpu(screen_path: str, fgr_path: str, pha_path: str,
                         fx0, fy0 = x0 - x, y0 - y
                         screen[y0:y1, x0:x1, :] = cam_r[fy0:fy0 + (y1 - y0), fx0:fx0 + (x1 - x0), :]
                 else:
+                    if mode not in ("real", "camera", "screen"):
+                        # image-mode window: the cutout composites over the cover-fit still
+                        screen = bg_tensors[mode].clone()
                     fgr = (torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float()
                            .permute(2, 0, 1).unsqueeze(0))
                     pha = (torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float()
@@ -495,7 +532,8 @@ def mix(project_id: str, edl_id: str, camera_path: str,
         rematte: bool = False, overlays: list[dict[str, Any]] | None = None,
         blurs: list[dict[str, Any]] | None = None,
         screen_keyframes: list[dict[str, Any]] | None = None,
-        bg_visible_until: float | None = None) -> dict[str, Any]:
+        bg_visible_until: float | None = None,
+        backgrounds: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Mix the camera into a project's cut screen with the full effect stack. The cut +
     matte are CACHED per (project, edl) under <project>/camera/; pass rematte=True to force
     a rebuild. Requires render(project_id, edl_id) first. `keyframes` = camera animation
@@ -522,8 +560,13 @@ def mix(project_id: str, edl_id: str, camera_path: str,
 
     if not keyframes:
         keyframes = [{"t": 0, "preset": "bottom-right"}]
+    # validate image-mode background windows up front (clear error before the GPU pass)
+    for w in (backgrounds or []):
+        m = w.get("mode", "real")
+        if m not in ("real", "camera", "screen") and not os.path.isfile(m):
+            raise FileNotFoundError(f"background window image not found: {m}")
     out = output_path or str(pdir / "renders" / f"{slug}_mixed.mp4")
-    effects = bool(overlays or blurs or screen_keyframes or bg_visible_until is not None)
+    effects = bool(overlays or blurs or screen_keyframes or bg_visible_until is not None or backgrounds)
 
     cached = False
     backend = "raw-inset"
@@ -538,7 +581,8 @@ def mix(project_id: str, edl_id: str, camera_path: str,
         try:
             info = composite_gpu(str(cut_screen), str(fgr), str(pha), keyframes, out,
                                  cut_cam_path=str(cut_cam), overlays=overlays, blurs=blurs,
-                                 screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until)
+                                 screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until,
+                                 backgrounds=backgrounds)
             backend = "rvm-gpu"
         except Exception:  # noqa: BLE001
             # CPU fallback keeps overlays/blur (compositor.compose) but not screen-zoom/bg-toggle.
@@ -879,3 +923,151 @@ def replace_background(project_id: str, edl_id: str, segments: list[dict[str, An
     return {"output": out, "size": [w, h], "duration": round(idx / fps, 2),
             "segments": len(segs), "backgrounds_used": sorted(used),
             "matte_backend": "rvm-gpu" if dev == "cuda" else "cpu"}
+
+
+# --- pause montage (the "millennial pause" gag) ---------------------------------------
+
+def _pick_pauses(silences: list[dict[str, Any]], count: int, min_dur: float) -> list[dict[str, Any]]:
+    """Genuine dead-air pauses (a silence gap of at least `min_dur`s — no words spoken), spread
+    EVENLY across the timeline, up to `count`. Even spread (not the first N) so the montage samples
+    the whole video. The clip is taken from INSIDE the gap at extraction time, so it is pure dead
+    air (breathing / room tone), never the surrounding speech. Pure."""
+    elig = [s for s in silences if s["dur"] >= min_dur]
+    if count <= 0 or len(elig) <= count:
+        return elig
+    step = len(elig) / count
+    return [elig[int(i * step)] for i in range(count)]
+
+
+def _norm_clip(src: str, start: float | None, dur: float | None, out: str,
+               audio_src: str | None = None) -> None:
+    """Trim + normalize a clip to identical CFR params (1080p30 h264 / 48k stereo aac) so a
+    list of them concat cleanly with -c copy. -ss before -i = fast keyframe seek. If `audio_src`
+    is given, the VIDEO comes from `src` and the AUDIO from `audio_src` at the same window — used
+    so a camera pause clip (whose own track is silent) carries the synced mic room tone/breathing."""
+    from .. import media
+    cmd = [config.FFMPEG, "-y", "-loglevel", "error"]
+    if start is not None:
+        cmd += ["-ss", f"{start}"]
+    if dur is not None:
+        cmd += ["-t", f"{dur}"]
+    cmd += ["-i", src]
+    amap = "0:a?"
+    if audio_src:
+        if start is not None:
+            cmd += ["-ss", f"{start}"]
+        if dur is not None:
+            cmd += ["-t", f"{dur}"]
+        cmd += ["-i", audio_src]
+        amap = "1:a?"
+    cmd += ["-map", "0:v:0", "-map", amap,
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=disable,fps=30,setsar=1",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-video_track_timescale", "30000",
+            "-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "192k", out]
+    media.run_ff(cmd)
+
+
+def _concat_files(parts: list, out: str) -> None:
+    """Concat identically-encoded clips via the concat demuxer (-c copy). Paths use forward
+    slashes so the demuxer list parses on Windows."""
+    from .. import media
+    lst = str(Path(out).with_suffix(".concat.txt"))
+    Path(lst).write_text(
+        "".join(f"file '{str(p).replace(chr(92), '/')}'\n" for p in parts), encoding="utf-8")
+    media.run_ff([config.FFMPEG, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                  "-i", lst, "-c", "copy", str(out)])
+
+
+def _frame_montage(montage: str, frame_image: str, screen_rect: list, out: str,
+                   frame_chroma: str | None = None) -> None:
+    """Wrap the montage inside a decorative frame image (e.g. a Pause-O-Vision TV bezel): the
+    frame is scaled to 1080 tall and centered on a black 1920x1080 canvas. `screen_rect` =
+    [x,y,w,h] (final-canvas px) is the inner screen. Without `frame_chroma` the montage is drawn
+    ON TOP of the frame at screen_rect. With `frame_chroma` (the screen's solid color, e.g.
+    '0x221b25') the frame's screen is keyed transparent and the montage is composited BEHIND the
+    frame (cover-filling the screen), so the bezel + title stay ON TOP and nothing is cut off."""
+    from .. import media
+    x, y, w, h = (int(v) for v in screen_rect)
+    if frame_chroma:
+        fc = (f"[0:v]scale=-2:1080,colorkey={frame_chroma}:0.26:0.12[frm];"
+              f"[1:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}[m];"
+              f"color=black:s=1920x1080:r=30[bg];"
+              f"[bg][m]overlay={x}:{y}:shortest=1[base];"
+              f"[base][frm]overlay=(W-w)/2:0[v]")
+    else:
+        fc = (f"[0:v]scale=-2:1080[frm];[1:v]scale={w}:{h}[m];"
+              f"color=black:s=1920x1080:r=30[bg];[bg][frm]overlay=(W-w)/2:0[t];"
+              f"[t][m]overlay={x}:{y}:shortest=1[v]")
+    media.run_ff([config.FFMPEG, "-y", "-loglevel", "error", "-i", frame_image, "-i", montage,
+                  "-filter_complex", fc, "-map", "[v]", "-map", "1:a?",
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                  "-video_track_timescale", "30000", "-c:a", "aac", "-ar", "48000", "-ac", "2", out])
+
+
+def pause_montage(project_id: str, edl_id: str, camera_path: str, at: float,
+                  count: int = 12, min_dur: float = 0.6, max_dur: float = 1.2,
+                  frame_image: str = "", screen_rect: list | None = None,
+                  frame_chroma: str | None = None, video_path: str = "",
+                  output_path: str = "") -> dict[str, Any]:
+    """Build a "millennial pause" montage of pure DEAD AIR and splice it into the composite at
+    cut-time `at`. Uses the transcript silence map: every gap of at least `min_dur`s where NO
+    words are spoken, spread across the video, up to `count`. Each clip is taken from INSIDE the
+    gap (word-boundary margins trimmed) so it is only you pausing — breathing / room tone, never
+    speech — capped at `max_dur`s. Audio is the raw camera's own track at that moment. Optionally
+    wrap the montage inside `frame_image` (a decorative bezel like a Pause-O-Vision TV): it's
+    centered on a black 1920x1080 canvas and the pauses play inside `screen_rect` = [x,y,w,h]
+    (final-canvas px). Inserted at `at` in the camera-mixed master (default <edl>_mixed.mp4).
+    Returns the spliced video + `montage_dur` — feed at/montage_dur to burn_captions to stay synced."""
+    import shutil
+    from .. import media
+    pdir = project.require_project(project_id)
+    slug = project.slugify(edl_id)
+    t = project.read_transcript(project_id)
+    picks = _pick_pauses(t.get("silences", []), int(count), float(min_dur))
+    if not picks:
+        raise ValueError(f"no silence gaps >= {min_dur}s to build a montage")
+    if not os.path.isfile(camera_path):
+        raise FileNotFoundError(f"camera file not found: {camera_path}")
+    vid = video_path or str(pdir / "renders" / f"{slug}_mixed.mp4")
+    if not os.path.isfile(vid):
+        raise FileNotFoundError(f"composite not found: {vid} — run mix_camera first")
+    # the camera capture's own audio track is silent (Source Record), so pull the montage audio
+    # (room tone / breathing during the pause) from the synced screen source if it has audio.
+    screen_src = project.read_meta(project_id).get("source")
+    audio_src = screen_src if (screen_src and os.path.isfile(screen_src)) else None
+    work = pdir / "renders" / "_montage"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    parts = []
+    margin = 0.06   # stay clear of the word boundaries on both sides of the gap
+    for i, s in enumerate(picks):
+        start = float(s["start"]) + margin
+        dur = min(float(max_dur), float(s["dur"]) - 2 * margin)
+        if dur < 0.15:
+            continue
+        cp = work / f"p{i:02d}.mp4"
+        _norm_clip(camera_path, start, dur, str(cp), audio_src=audio_src)
+        parts.append(cp)
+    if not parts:
+        raise ValueError("no usable dead-air clips after trimming word-boundary margins")
+    montage = work / "montage.mp4"
+    _concat_files(parts, str(montage))
+    if frame_image:
+        if not os.path.isfile(frame_image):
+            raise FileNotFoundError(f"frame image not found: {frame_image}")
+        framed = work / "framed.mp4"
+        _frame_montage(str(montage), frame_image,
+                       screen_rect or [484, 140, 951, 724], str(framed),
+                       frame_chroma=frame_chroma)
+        montage = framed
+    montage_dur = media.probe(str(montage))["duration"]
+    pre, post = work / "pre.mp4", work / "post.mp4"
+    _norm_clip(vid, 0.0, float(at), str(pre))
+    _norm_clip(vid, float(at), None, str(post))
+    out = output_path or str(pdir / "renders" / f"{slug}_montage.mp4")
+    _concat_files([pre, montage, post], out)
+    return {"project_id": project_id, "edl_id": edl_id, "output": out,
+            "inserted_at": round(float(at), 3), "montage_dur": round(float(montage_dur), 3),
+            "clips_used": len(parts)}

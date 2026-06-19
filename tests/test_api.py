@@ -30,6 +30,7 @@ def test_audio_dsp_wrappers_delegate(monkeypatch):
         (lambda: api.audio_fade("s.wav", fade_in_s=1), "fade"),
         (lambda: api.audio_mix(["a.wav", "b.wav"]), "mix"),
         (lambda: api.audio_convert("s.wav", fmt="mp3"), "convert"),
+        (lambda: api.audio_enhance("s.mp4", target_lufs=-16), "enhance"),
     ]
     for call, dele in cases:
         _spy(monkeypatch, api._dsp, dele, {"ok": dele})
@@ -102,8 +103,11 @@ def test_compose_and_mix_wrappers_delegate(monkeypatch):
     _spy(monkeypatch, compc, "compose", {"ok": "compose"})
     assert api.compose_camera("scr", "cam", [], "out") == {"ok": "compose"}
     cap = _spy(monkeypatch, cmx, "mix", {"ok": "mix"})
-    assert api.mix_camera("p", "e", "cam", overlays=[{"x": 1}], bg_visible_until=3.0) == {"ok": "mix"}
+    bgs = [{"start": 0, "end": 5, "mode": "real"}, {"start": 5, "end": 8, "mode": "C:/bg.png"}]
+    assert api.mix_camera("p", "e", "cam", overlays=[{"x": 1}], bg_visible_until=3.0,
+                          backgrounds=bgs) == {"ok": "mix"}
     assert cap["kwargs"]["overlays"] == [{"x": 1}] and cap["kwargs"]["bg_visible_until"] == 3.0
+    assert cap["kwargs"]["backgrounds"] == bgs
     cap2 = _spy(monkeypatch, cmx, "short_clip", {"ok": "short"})
     assert api.make_short("p", "e", 0, 5, "Hook", overlays=[{"y": 2}]) == {"ok": "short"}
     assert cap2["kwargs"]["overlays"] == [{"y": 2}]
@@ -116,6 +120,26 @@ def test_replace_background_wrapper_delegates(monkeypatch):
     assert api.replace_background("p", "e", segs, max_duration=20) == {"ok": "bg"}
     assert cap["args"][:3] == ("p", "e", segs)
     assert cap["kwargs"]["max_duration"] == 20
+
+
+def test_pause_montage_wrapper_delegates(monkeypatch):
+    cap = _spy(monkeypatch, cmx, "pause_montage", {"ok": "montage"})
+    out = api.pause_montage("p", "e", "cam.mkv", 236.5, count=8, min_dur=0.4,
+                            frame_image="pov.png", screen_rect=[484, 140, 951, 724],
+                            frame_chroma="0x221b25")
+    assert out == {"ok": "montage"}
+    assert cap["args"][:4] == ("p", "e", "cam.mkv", 236.5)
+    assert cap["kwargs"]["count"] == 8 and cap["kwargs"]["min_dur"] == 0.4
+    assert cap["kwargs"]["frame_image"] == "pov.png"
+    assert cap["kwargs"]["screen_rect"] == [484, 140, 951, 724]
+    assert cap["kwargs"]["frame_chroma"] == "0x221b25"
+
+
+def test_burn_captions_is_wired_and_render_op():
+    # burn_captions is exposed (alias to ops) and registered as a render op
+    assert api.burn_captions is api.ops.burn_captions
+    assert "burn_captions" in api._RENDER_OPS and "pause_montage" in api._RENDER_OPS
+    assert "burn_captions" in api.OPERATIONS and "pause_montage" in api.OPERATIONS
 
 
 def test_get_cut_transcript_reads_text(monkeypatch, tmp_path):

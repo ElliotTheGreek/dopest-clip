@@ -83,6 +83,26 @@ def test_position_override_changes_alignment(out_words):
     assert ",8,60,60," in main_style
 
 
+def test_top_window_routes_lines_to_top_style(out_words):
+    # karaoke groups into 4-word lines: line1 starts 0.0, line2 starts 2.0. A window covering
+    # line1's start routes it to Top; line2 stays Main.
+    ass = captions.build_ass(out_words, 1080, 1920, preset="karaoke-bold",
+                             top_window=(0.0, 1.5))
+    assert "Style: Top," in ass                       # the top twin style is declared
+    # a Top style line is alignment 8 (the field before MarginL 60)
+    top_style = [ln for ln in ass.splitlines() if ln.startswith("Style: Top,")][0]
+    assert ",8,60,60," in top_style
+    # at least one dialogue uses Top and at least one uses Main
+    dl = [ln for ln in ass.splitlines() if ln.startswith("Dialogue:")]
+    assert any(",Top,," in ln for ln in dl) and any(",Main,," in ln for ln in dl)
+
+
+def test_no_top_window_keeps_all_main(out_words):
+    ass = captions.build_ass(out_words, 1080, 1920, preset="karaoke-bold")
+    dl = [ln for ln in ass.splitlines() if ln.startswith("Dialogue:")]
+    assert dl and not any(",Top,," in ln for ln in dl)
+
+
 def test_unknown_preset_raises(out_words):
     with pytest.raises(ValueError):
         captions.build_ass(out_words, 1080, 1920, preset="does-not-exist")

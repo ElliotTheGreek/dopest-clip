@@ -351,6 +351,56 @@ def render(
     }
 
 
+# --- caption burn over a finished composite -------------------------------------------
+
+def burn_captions(project_id: str, edl_id: str, video_path: str = "",
+                  position: str = "bottom", top_window: list | None = None,
+                  montage_at: float | None = None, montage_dur: float = 0.0,
+                  preset: str = "karaoke-bold", output_path: str = "") -> dict:
+    """Burn word-highlight captions over a finished composite (the camera-mixed master). Words
+    come from the EDL's OUTPUT timeline (same source the styled render uses). `position` =
+    'bottom'|'top'; `top_window` = [start, end] cut-seconds that flips captions to the TOP for
+    that span (e.g. a dictation demo), back to `position` outside it; `montage_at`/`montage_dur`
+    shift every word after an inserted pause montage so captions stay synced. Default video is
+    the project's <edl>_mixed.mp4; writes <edl>_captioned.mp4."""
+    if not project.transcript_json_path(project_id).exists():
+        return {"error": f"no transcript for '{project_id}' — call transcribe first"}
+    edl_p = project.edl_path(project_id, edl_id)
+    if not edl_p.exists():
+        return {"error": f"no saved EDL '{edl_id}'"}
+    t = project.read_transcript(project_id)
+    cleaned, _ = edl.apply_cleanup(project.read_json(edl_p), t)
+    resolved = edl.resolve_edl(cleaned, t)
+    words = edl.remap_to_output_timeline(resolved, t)
+    tw = [float(top_window[0]), float(top_window[1])] if top_window else None
+    if montage_at is not None and montage_dur:
+        cut, off = float(montage_at), float(montage_dur)
+        for w in words:
+            if w["start"] >= cut:
+                w["start"] += off
+                w["end"] += off
+        if tw and tw[0] >= cut:
+            tw = [tw[0] + off, tw[1] + off]
+    meta = project.read_meta(project_id)
+    slug = project.slugify(edl_id)
+    vid = Path(video_path) if video_path else project.render_path(project_id, edl_id).with_name(f"{slug}_mixed.mp4")
+    if not vid.exists():
+        return {"error": f"video not found: {vid} — run mix_camera first"}
+    ass = captions.build_ass(words, meta["width"], meta["height"], preset=preset,
+                             position=position, top_window=(tw[0], tw[1]) if tw else None)
+    ass_path = vid.with_name(f"{slug}_captions.ass")
+    ass_path.write_text(ass, encoding="utf-8")
+    out = Path(output_path) if output_path else vid.with_name(f"{slug}_captioned.mp4")
+    sub = f"subtitles=filename='{media.escape_filter_path(ass_path)}'"
+    sub += f":fontsdir='{media.escape_filter_path(captions.FONTS_DIR)}'"
+    media.run_ff([config.FFMPEG, "-y", "-loglevel", "error", "-i", str(vid), "-vf", sub,
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                  "-c:a", "copy", str(out)])
+    return {"project_id": project_id, "edl_id": edl_id, "output": str(out),
+            "captioned_from": str(vid), "preset": preset, "position": position,
+            "top_window": tw, "word_count": len(words)}
+
+
 # --- QA -------------------------------------------------------------------------------
 
 def verify_clip(project_id: str, edl_id: str, backend: str | None = None) -> dict:

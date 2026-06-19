@@ -145,6 +145,13 @@ different background — per time window. `replace_background(edl_id, segments, 
   Example: open on the real room, then cycle a few generated backgrounds —
   segments=[{start:0,end:8,background:"camera"}, {start:8,end:20,background:".../bg_window.png"},
   {start:20,end:32,background:".../bg_shelves.png"}]. Run via start_render for real lengths.
+- INLINE in the full effect stack: mix_camera also takes `backgrounds`=[{start, end, mode}]
+  (CUT-timeline) so a bg swap rides ALONGSIDE the camera animation + overlays in one pass. mode =
+  `"real"` (full recorded room), `"screen"` (cutout over the cut desktop — a PIP-over-screen
+  screen-share moment), or an image PATH (cutout over that cover-fit still). A covering window
+  wins; uncovered time falls back to bg_visible_until ('real' before it, else 'screen'). Use this
+  when the swap must coexist with labels/zoom; use the standalone replace_background for a pure
+  bg-only render.
 
 ## Connection (env)
 OBS_WS_HOST (localhost), OBS_WS_PORT (4455), OBS_WS_PASSWORD, OBS_SCENE_NAME, OBS_CAMERA_DIR.
@@ -232,6 +239,10 @@ RESOURCES["learn://audio"] = """\
 ## Local ffmpeg DSP (no provider needed)
 normalize (loudnorm I=-14:TP=-1.5:LRA=11), denoise (afftdn/arnndn), trim_silence
 (silenceremove), gain, fade, mix, convert. All run through the shared ffmpeg runner.
+- enhance: one-pass VOICE clarity + consistency — high-pass (cut rumble) -> denoise -> compressor
+  (even out loud/quiet) -> de-mud + presence EQ -> loudnorm (target_lufs, default -16). Works on an
+  audio file OR a finished VIDEO (video stream copied bit-exact, only audio re-encoded), so it's the
+  final polish over a captioned master. Tune target_lufs / denoise_db / presence_db.
 
 ## Cloud (via the provider registry — see learn://providers)
 - tts: synthesize speech (Fish / FlowDot)

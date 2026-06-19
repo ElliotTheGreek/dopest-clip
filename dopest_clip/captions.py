@@ -80,6 +80,7 @@ def build_ass(
     title: str | None = None,
     title_hold: float = 3.0,
     margin_v: int | None = None,
+    top_window: tuple[float, float] | None = None,
 ) -> str:
     if preset not in PRESETS:
         raise ValueError(f"unknown caption preset '{preset}' (have: {', '.join(PRESETS)})")
@@ -93,12 +94,21 @@ def build_ass(
     upper = p["uppercase"]
 
     title_size = max(16, int(video_h * 0.055))
+    top_margin_v = int(video_h * 0.06)
     styles = [
         f"Style: Main,{fontname},{size},{_WHITE},{_YELLOW},{_BLACK},{_BLACK},"
         f"{p['bold']},0,0,0,100,100,0,0,1,{p['outline']},{p['shadow']},{align},60,60,{margin_v},1",
+        # a top-aligned twin of Main, for a window where the captions jump above the subject
+        f"Style: Top,{fontname},{size},{_WHITE},{_YELLOW},{_BLACK},{_BLACK},"
+        f"{p['bold']},0,0,0,100,100,0,0,1,{p['outline']},{p['shadow']},8,60,60,{top_margin_v},1",
         f"Style: Title,Anton,{title_size},{_WHITE},{_YELLOW},{_BLACK},{_BLACK},"
         f"1,0,0,0,100,100,0,0,1,5,2,8,60,60,{int(video_h*0.06)},1",
     ]
+
+    def _style_for(line_start: float) -> str:
+        if top_window and top_window[0] <= line_start < top_window[1]:
+            return "Top"
+        return "Main"
 
     header = (
         "[Script Info]\n"
@@ -126,10 +136,11 @@ def build_ass(
     for line in lines:
         line_start = line[0]["start"]
         line_end = line[-1]["end"]
+        style = _style_for(line_start)
         if not p["per_word"]:
             text = _disp(" ".join(w["w"] for w in line), upper)
             events.append(
-                f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},Main,,0,0,0,,{text}"
+                f"Dialogue: 0,{_ass_time(line_start)},{_ass_time(line_end)},{style},,0,0,0,,{text}"
             )
             continue
         # per-word: one event per word holding the whole line, active word emphasized
@@ -147,7 +158,7 @@ def build_ass(
                     parts.append(token)
             text = " ".join(parts)
             events.append(
-                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Main,,0,0,0,,{text}"
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},{style},,0,0,0,,{text}"
             )
 
     return header + "\n".join(events) + "\n"

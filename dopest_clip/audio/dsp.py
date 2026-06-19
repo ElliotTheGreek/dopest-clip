@@ -117,6 +117,28 @@ def _mix_cmd(srcs: list[str], out: str, weights: list[float] | None = None) -> l
     return cmd
 
 
+def _enhance_cmd(
+    src: str, out: str, *, target_lufs: float = -16.0, denoise_db: float = 12.0,
+    presence_db: float = 3.0, copy_video: bool = False,
+) -> list[str]:
+    """Speech clarity + consistency chain: high-pass (kill rumble/handling) -> spectral denoise
+    -> compressor (even out loud/quiet) -> de-mud + presence EQ -> EBU R128 loudnorm (consistent
+    loudness). `copy_video` keeps a video stream bit-exact and only re-encodes the audio."""
+    chain = (
+        "highpass=f=80,"
+        f"afftdn=nr={denoise_db:g}:nf=-25,"
+        "acompressor=threshold=-20dB:ratio=3:attack=5:release=150,"
+        "equalizer=f=300:t=q:w=1.2:g=-2,"
+        f"equalizer=f=3200:t=q:w=2:g={presence_db:g},"
+        f"loudnorm=I={target_lufs:g}:TP=-1.5:LRA=11"
+    )
+    cmd = [config.FFMPEG, "-y", "-i", str(src)]
+    if copy_video:
+        cmd += ["-c:v", "copy"]
+    cmd += ["-af", chain, "-c:a", "aac", "-b:a", "192k", str(out)]
+    return cmd
+
+
 def _convert_cmd(
     src: str,
     out: str,
@@ -190,6 +212,23 @@ def mix(srcs, out=None, weights=None, *, project_id=None, name="mixed") -> dict:
     cmd = _mix_cmd(srcs, str(dst), weights)
     media.run_ff(cmd)
     return {"out": str(dst), "inputs": srcs, "weights": weights}
+
+
+def enhance(
+    src, out=None, target_lufs=-16.0, denoise_db=12.0, presence_db=3.0,
+    *, project_id=None, name="enhanced",
+) -> dict:
+    """Make voice audio clearer + more consistent in one pass (high-pass -> denoise -> compress
+    -> presence EQ -> loudnorm). Works on an audio file OR a finished VIDEO — if the input has a
+    video stream it's copied bit-exact and only the audio is re-encoded. Tune `target_lufs`
+    (loudness), `denoise_db` (noise reduction), `presence_db` (clarity boost)."""
+    dst = _resolve_out(out, project_id, name, _ext_of(Path(out)) if out else "wav")
+    has_video = bool(media.probe(str(src)).get("width"))
+    cmd = _enhance_cmd(str(src), str(dst), target_lufs=target_lufs, denoise_db=denoise_db,
+                       presence_db=presence_db, copy_video=has_video)
+    media.run_ff(cmd)
+    return {"out": str(dst), "target_lufs": target_lufs, "denoise_db": denoise_db,
+            "presence_db": presence_db, "video_copied": has_video}
 
 
 def convert(

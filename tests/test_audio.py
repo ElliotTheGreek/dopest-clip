@@ -41,6 +41,24 @@ def test_normalize_cmd():
     assert cmd[-1] == "out.wav"
 
 
+def test_enhance_cmd_chain_and_audio_only():
+    cmd = dsp._enhance_cmd("in.wav", "out.wav", target_lufs=-16, denoise_db=12, presence_db=3)
+    af = cmd[cmd.index("-af") + 1]
+    # full speech-clarity chain in order
+    assert af.startswith("highpass=f=80,afftdn=nr=12")
+    assert "acompressor=" in af and "equalizer=f=3200:t=q:w=2:g=3" in af
+    assert af.endswith("loudnorm=I=-16:TP=-1.5:LRA=11")
+    # audio-only: no video copy
+    assert "-c:v" not in cmd
+    assert "-c:a" in cmd and cmd[-1] == "out.wav"
+
+
+def test_enhance_cmd_copies_video_when_present():
+    cmd = dsp._enhance_cmd("in.mp4", "out.mp4", copy_video=True)
+    assert cmd[cmd.index("-c:v") + 1] == "copy"   # video kept bit-exact, only audio re-encoded
+    assert "-af" in cmd
+
+
 def test_denoise_cmd_afftdn():
     cmd = dsp._denoise_cmd("in.wav", "out.wav", "afftdn")
     assert cmd[cmd.index("-af") + 1] == "afftdn"

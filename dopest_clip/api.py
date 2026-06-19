@@ -35,6 +35,7 @@ preview_reframe = ops.preview_reframe
 list_caption_presets = ops.list_caption_presets
 list_reframe_modes = ops.list_reframe_modes
 suggest_clips = ops.suggest_clips
+burn_captions = ops.burn_captions
 
 
 # --- audio: local DSP -----------------------------------------------------------------
@@ -71,6 +72,14 @@ def audio_mix(srcs: list[str], out: str | None = None, weights: list[float] | No
 def audio_convert(src: str, out: str | None = None, fmt: str | None = None, sample_rate: int | None = None, channels: int | None = None, project_id: str | None = None, name: str = "converted") -> dict:
     """Convert audio format / sample rate / channel count."""
     return _dsp.convert(src, out, fmt=fmt, sample_rate=sample_rate, channels=channels, project_id=project_id, name=name)
+
+
+def audio_enhance(src: str, out: str | None = None, target_lufs: float = -16.0, denoise_db: float = 12.0, presence_db: float = 3.0, project_id: str | None = None, name: str = "enhanced") -> dict:
+    """Make voice audio clearer + more consistent in ONE pass: high-pass (cut rumble) -> denoise ->
+    compressor (even out loud/quiet) -> de-mud + presence EQ -> EBU R128 loudnorm. Works on an
+    audio file OR a finished VIDEO (the video stream is copied bit-exact, only audio re-encoded), so
+    it can be the final polish over <edl>_captioned.mp4. Tune target_lufs / denoise_db / presence_db."""
+    return _dsp.enhance(src, out, target_lufs=target_lufs, denoise_db=denoise_db, presence_db=presence_db, project_id=project_id, name=name)
 
 
 # --- audio: cloud (provider-routed) ---------------------------------------------------
@@ -223,7 +232,8 @@ def compose_camera(screen_path: str, camera_path: str, keyframes: list[dict], ou
 def mix_camera(project_id: str, edl_id: str, camera_path: str, keyframes: list[dict] | None = None,
                remove_background: bool = True, output_path: str = "", rematte: bool = False,
                overlays: list[dict] | None = None, blurs: list[dict] | None = None,
-               screen_keyframes: list[dict] | None = None, bg_visible_until: float | None = None) -> dict:
+               screen_keyframes: list[dict] | None = None, bg_visible_until: float | None = None,
+               backgrounds: list[dict] | None = None) -> dict:
     """Mix the camera into a project's cut screen (GPU matte+NVENC, cut-synced) with the full
     effect stack — all optional, all timed in CUT-timeline seconds (see get_cut_transcript):
     `keyframes` animate the camera (presets fullscreen/center/pip/top-left/.../pos+scale, for
@@ -240,12 +250,18 @@ def mix_camera(project_id: str, edl_id: str, camera_path: str, keyframes: list[d
     the target: a halo/bulb ABOVE the head = source 'camera', target 'face', offset [0,-0.9]; a ring
     AROUND the head = offset [0,0] with the ring scaled to the head; a badge to the side = offset
     [0.9,0]. Camera-source overlays land on the cutout wherever the camera sits (PIP/fullscreen/
-    animated). Use preview_track first to confirm the target locks on."""
+    animated). Use preview_track first to confirm the target locks on. `backgrounds` swap the
+    background per CUT-timeline window: a list of {start, end, mode} where mode is 'real' (the
+    full recorded room), 'screen' (cutout over the cut desktop — for a PIP-over-screen moment),
+    or a path to a still IMAGE the cutout composites over (cover-fit). A covering window wins;
+    uncovered time falls back to bg_visible_until ('real' before it, else 'screen'). This folds
+    the bg-swap + screen-share moments into one pass with the camera animation and overlays."""
     from .obs import camera_mix
     return camera_mix.mix(project_id, edl_id, camera_path, keyframes=keyframes,
                           remove_background=remove_background, output_path=output_path,
                           rematte=rematte, overlays=overlays, blurs=blurs,
-                          screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until)
+                          screen_keyframes=screen_keyframes, bg_visible_until=bg_visible_until,
+                          backgrounds=backgrounds)
 
 
 def get_cut_transcript(project_id: str, edl_id: str) -> dict:
@@ -315,6 +331,29 @@ def replace_background(project_id: str, edl_id: str, segments: list[dict], outpu
                                          output_path=output_path, max_duration=max_duration)
 
 
+def pause_montage(project_id: str, edl_id: str, camera_path: str, at: float, count: int = 12,
+                  min_dur: float = 0.6, max_dur: float = 1.2,
+                  frame_image: str = "", screen_rect: list | None = None,
+                  frame_chroma: str | None = None, video_path: str = "",
+                  output_path: str = "") -> dict:
+    """Build a "millennial pause" montage of pure DEAD AIR and splice it into the camera-mixed
+    master at cut-time `at`. Uses the silence map: every gap >= `min_dur`s with NO words, spread
+    across the video, up to `count`; each clip is taken from INSIDE the gap (word margins trimmed,
+    capped at `max_dur`s) so it's only you pausing — breathing/room tone, never speech. Optionally
+    wrap inside `frame_image` (a bezel like a Pause-O-Vision TV) with the pauses inside
+    `screen_rect`=[x,y,w,h] (final 1920x1080 px). If `frame_chroma` is set (the screen's solid
+    color, e.g. '0x221b25'), the frame's screen is keyed transparent and the video sits BEHIND the
+    border (bezel + title stay on top, nothing cut off); otherwise the video is drawn on top of the
+    frame. Default video is the project's <edl>_mixed.mp4. Returns the spliced video + `montage_dur`
+    — pass at/montage_dur to burn_captions to stay synced. Run via start_render for real lengths."""
+    from .obs import camera_mix
+    return camera_mix.pause_montage(project_id, edl_id, camera_path, at, count=count,
+                                    min_dur=min_dur, max_dur=max_dur,
+                                    frame_image=frame_image, screen_rect=screen_rect,
+                                    frame_chroma=frame_chroma, video_path=video_path,
+                                    output_path=output_path)
+
+
 def list_graphics() -> dict:
     """The built-in overlay graphic kinds and their params, for use in compose_camera
     `overlays`. You can also pass a custom inline `svg` or a pre-rendered transparent
@@ -338,7 +377,8 @@ def list_graphics() -> dict:
 
 
 # --- async render jobs (long renders run in the background; poll instead of blocking) ----
-_RENDER_OPS = {"mix_camera", "make_short", "render", "compose_camera", "verify_clip", "replace_background"}
+_RENDER_OPS = {"mix_camera", "make_short", "render", "compose_camera", "verify_clip",
+               "replace_background", "pause_montage", "burn_captions", "audio_enhance"}
 
 
 def start_render(operation: str, params: dict | None = None) -> dict:
@@ -378,14 +418,15 @@ GROUPS: dict[str, list] = {
                 validate_edl, render, verify_clip, extract_thumbnail, grab_frame,
                 preview_reframe, list_caption_presets, list_reframe_modes, suggest_clips],
     "audio": [audio_normalize, audio_denoise, audio_trim_silence, audio_gain, audio_fade,
-              audio_mix, audio_convert, tts, asr, sfx, audio_qa],
+              audio_mix, audio_convert, audio_enhance, tts, asr, sfx, audio_qa],
     "image": [image_generate, image_edit, image_compose, image_analyze, image_crop,
               image_resize, image_pad, image_square_canvas, image_invert,
               image_remove_background, image_svg_to_png, image_info, image_icon_set],
     "providers": [list_providers, set_provider, validate_provider],
     "recording": [list_devices, setup_scene, start_recording, stop_recording,
                   recording_status, compose_camera, mix_camera, get_cut_transcript,
-                  make_short, list_graphics, preview_track, replace_background],
+                  make_short, list_graphics, preview_track, replace_background,
+                  pause_montage, burn_captions],
     "jobs": [start_render, render_status, list_render_jobs],
 }
 

@@ -273,10 +273,18 @@ def compute_track(video_path: str, target: Any, *, every: int | None = None,
     [{t, x, y, w, h}]. Cached to cache_path (json) when given. Detectors are lazy (cv2/YOLO)."""
     validate_target(target)
     if cache_path and os.path.isfile(cache_path):
+        # only trust the cache if it is at least as new as the source video — otherwise the
+        # video was re-cut (e.g. an EDL change rebuilt the matte) and the cached track is from
+        # the OLD timeline, which makes overlays follow the target from the wrong moment.
         try:
-            return json.loads(open(cache_path, encoding="utf-8").read())["track"]
-        except (OSError, ValueError, KeyError):
-            pass
+            cache_fresh = os.path.getmtime(cache_path) >= os.path.getmtime(video_path)
+        except OSError:
+            cache_fresh = True   # can't stat the video (e.g. missing) — fall back to the cache
+        if cache_fresh:
+            try:
+                return json.loads(open(cache_path, encoding="utf-8").read())["track"]
+            except (OSError, ValueError, KeyError):
+                pass
     import cv2
     cap = cv2.VideoCapture(video_path)
     vfps = float(fps or cap.get(cv2.CAP_PROP_FPS) or 30.0)
