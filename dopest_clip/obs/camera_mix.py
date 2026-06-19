@@ -758,3 +758,124 @@ def short_clip(project_id: str, edl_id: str, from_word: int, to_word: int,
     return vertical_clip(str(cut_screen), str(fgr), str(pha), cj, from_word, to_word,
                          hook_title, out, caption_preset=caption_preset,
                          screen_keyframes=screen_keyframes, overlays=overlays)
+
+
+# --- background replacement (cutout over a provided still image, per time window) --------
+
+def _cover_to(img, w: int, h: int):
+    """Resize a BGR image to COVER (w,h) (no distortion) and centre-crop to exactly (w,h)."""
+    import cv2
+    ih, iw = img.shape[:2]
+    scale = max(w / iw, h / ih)
+    nw, nh = max(w, int(round(iw * scale))), max(h, int(round(ih * scale)))
+    r = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    x0, y0 = (nw - w) // 2, (nh - h) // 2
+    return r[y0:y0 + h, x0:x0 + w]
+
+
+def _segment_at(segs: list[dict[str, Any]], t: float):
+    """The background of the LAST segment covering time t (cut-timeline seconds); 'camera'
+    (the real recorded background, passthrough) if no segment covers t. Pure."""
+    active = "camera"
+    for s in segs:
+        if s["start"] <= t < s["end"]:
+            active = s["background"]
+    return active
+
+
+def replace_background(project_id: str, edl_id: str, segments: list[dict[str, Any]],
+                       output_path: str = "", max_duration: float | None = None) -> dict[str, Any]:
+    """Re-background the talking head: composite the cached cutout (matte) over a DIFFERENT
+    background per time window. `segments` = [{start, end, background}] in cut-timeline seconds;
+    `background` is either "camera" (show the REAL recorded room, no cutout — the original
+    frames) or a path to a still IMAGE the cutout is composited over (cover-fit to the frame).
+    The background image is produced however you like (for us: the Gemini image toolkit to remove
+    the person and modify the office); this op is provider-agnostic — it just composites. Reuses
+    the cached cut camera + RVM matte, so run mix_camera(edl_id, remove_background=True) first.
+    Audio comes from the cut screen. GPU compose + NVENC when CUDA is present. `max_duration`
+    caps the render (for a quick sample)."""
+    import cv2
+    import numpy as np
+    import torch
+
+    pdir = project.require_project(project_id)
+    slug = project.slugify(edl_id)
+    cam_dir = pdir / "camera"
+    cut_cam, fgr, pha = cam_dir / f"{slug}_cut.mp4", cam_dir / f"{slug}_fgr.mp4", cam_dir / f"{slug}_pha.mp4"
+    screen = pdir / "renders" / f"{slug}.mp4"
+    for pth, what in ((cut_cam, "cut camera"), (fgr, "camera foreground matte"), (pha, "camera alpha matte")):
+        if not pth.exists():
+            raise FileNotFoundError(
+                f"{what} not found at {pth}; run mix_camera(edl_id='{edl_id}', "
+                "remove_background=True) first to build the cached matte")
+    if not segments:
+        raise ValueError("replace_background needs at least one segment {start, end, background}")
+    segs = []
+    for s in segments:
+        bg = s["background"]
+        if bg != "camera" and not os.path.isfile(bg):
+            raise FileNotFoundError(f"background image not found: {bg}")
+        segs.append({"start": float(s.get("start", 0.0)), "end": float(s.get("end", 1e9)), "background": bg})
+    segs.sort(key=lambda x: x["start"])
+
+    cap_c, cap_f, cap_p = cv2.VideoCapture(str(cut_cam)), cv2.VideoCapture(str(fgr)), cv2.VideoCapture(str(pha))
+    fps = cap_c.get(cv2.CAP_PROP_FPS) or 30.0
+    w, h = int(cap_c.get(3)), int(cap_c.get(4))
+    dev = "cuda" if _cuda_available() else "cpu"
+
+    bg_cache: dict[str, Any] = {}
+    for s in segs:
+        bg = s["background"]
+        if bg != "camera" and bg not in bg_cache:
+            img = cv2.imread(bg, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"could not read background image: {bg}")
+            bg_cache[bg] = torch.from_numpy(
+                cv2.cvtColor(_cover_to(img, w, h), cv2.COLOR_BGR2RGB)).to(dev).float()
+
+    out = output_path or str(pdir / "renders" / f"{slug}_bgreplace.mp4")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    enc = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21"] if _nvenc_ok()
+           else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"])
+    proc = subprocess.Popen(
+        [config.FFMPEG, "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-s", f"{w}x{h}", "-r", f"{fps:.4f}", "-i", "pipe:0", "-i", str(screen),
+         "-map", "0:v:0", "-map", "1:a:0?", *enc, "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "192k", "-shortest", out],
+        stdin=subprocess.PIPE)
+
+    idx = 0
+    used: set = set()
+    try:
+        with torch.no_grad():
+            while True:
+                ok_c, cf = cap_c.read()
+                if not ok_c:
+                    break
+                ok_f, f = cap_f.read()
+                ok_p, p = cap_p.read()
+                if not (ok_f and ok_p):
+                    break
+                t = idx / fps
+                idx += 1
+                if max_duration is not None and t >= float(max_duration):
+                    break
+                bg = _segment_at(segs, t)
+                used.add(bg)
+                if bg == "camera":
+                    proc.stdin.write(np.ascontiguousarray(cv2.cvtColor(cf, cv2.COLOR_BGR2RGB)).tobytes())
+                    continue
+                base = bg_cache[bg]
+                fgr_t = torch.from_numpy(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)).to(dev).float()
+                a = torch.from_numpy(cv2.cvtColor(p, cv2.COLOR_BGR2GRAY)).to(dev).float().div(255.0).unsqueeze(-1)
+                comp = base * (1 - a) + fgr_t * a
+                proc.stdin.write(comp.clamp(0, 255).byte().cpu().numpy().tobytes())
+    finally:
+        cap_c.release(); cap_f.release(); cap_p.release()
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"replace_background ffmpeg failed (rc={rc})")
+    return {"output": out, "size": [w, h], "duration": round(idx / fps, 2),
+            "segments": len(segs), "backgrounds_used": sorted(used),
+            "matte_backend": "rvm-gpu" if dev == "cuda" else "cpu"}

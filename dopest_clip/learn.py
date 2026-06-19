@@ -128,6 +128,24 @@ Every effect above sits at static keyframes. To make one RIDE a moving target in
   clear error telling you to grab+crop one. Detectors run on cv2 (cursor/face/template) or GPU
   YOLO (COCO classes); the rest of the GPU compose pass is unchanged.
 
+## Replace the background behind the cutout (AI or any still image)
+Because we already hold the cutout matte, the recorded room behind you can be swapped for a
+different background — per time window. `replace_background(edl_id, segments, ...)`:
+- `segments` = [{start, end, background}] in CUT-timeline seconds. `background` is `"camera"`
+  (show the REAL recorded room — original frames, no cutout) or a PATH to a still image the
+  cutout is composited over (cover-fit to the frame).
+- The background image is produced HOWEVER you like — this op is provider-agnostic and only
+  composites. Our local recipe: take one camera frame (grab it with ffmpeg / extract_thumbnail),
+  feed it to an image model (e.g. the FlowDot Gemini image toolkit or any image editor) with
+  "remove the person and show the empty room, then add a window / bookshelves / etc." to get a
+  modified-but-familiar background, then pass that PNG as a segment background. Other users plug
+  in whatever image tool they have.
+- Reuses the cached cut camera + RVM matte (run mix_camera(remove_background=True) first), takes
+  audio from the cut screen, composes on the GPU + NVENC. `max_duration` caps it for a sample.
+  Example: open on the real room, then cycle a few generated backgrounds —
+  segments=[{start:0,end:8,background:"camera"}, {start:8,end:20,background:".../bg_window.png"},
+  {start:20,end:32,background:".../bg_shelves.png"}]. Run via start_render for real lengths.
+
 ## Connection (env)
 OBS_WS_HOST (localhost), OBS_WS_PORT (4455), OBS_WS_PASSWORD, OBS_SCENE_NAME, OBS_CAMERA_DIR.
 

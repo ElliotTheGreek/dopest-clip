@@ -240,6 +240,37 @@ def test_split_track_wrapper_dict_form():
     assert out_kfs == [{"t": 0}] and track == {"target": "face"}
 
 
+# --- background replacement: segment selection (pure) + cover-fit (cv2) ----------------
+
+def test_segment_at_picks_covering_segment_else_camera():
+    from dopest_clip.obs import camera_mix
+    segs = [{"start": 0.0, "end": 8.0, "background": "camera"},
+            {"start": 8.0, "end": 20.0, "background": "/bg/window.png"},
+            {"start": 20.0, "end": 32.0, "background": "/bg/shelves.png"}]
+    assert camera_mix._segment_at(segs, 2.0) == "camera"
+    assert camera_mix._segment_at(segs, 8.0) == "/bg/window.png"     # inclusive start
+    assert camera_mix._segment_at(segs, 19.999) == "/bg/window.png"
+    assert camera_mix._segment_at(segs, 20.0) == "/bg/shelves.png"   # exclusive end
+    assert camera_mix._segment_at(segs, 99.0) == "camera"            # no cover -> real room
+
+
+def test_segment_at_last_overlapping_wins():
+    from dopest_clip.obs import camera_mix
+    segs = [{"start": 0.0, "end": 10.0, "background": "/a.png"},
+            {"start": 5.0, "end": 10.0, "background": "/b.png"}]
+    assert camera_mix._segment_at(segs, 7.0) == "/b.png"             # later segment overrides
+
+
+def test_cover_to_dimensions_and_no_distortion():
+    pytest.importorskip("cv2")
+    import numpy as np
+    from dopest_clip.obs import camera_mix
+    # a 100x50 image cover-fit to 200x200 -> exactly 200x200 (scaled to cover, centre-cropped)
+    img = np.zeros((50, 100, 3), dtype="uint8")
+    out = camera_mix._cover_to(img, 200, 200)
+    assert out.shape[0] == 200 and out.shape[1] == 200
+
+
 # --- live: detectors + full loop against a synthetic video (needs cv2) ----------------
 
 def _make_moving_square_video(path, n=30, w=160, h=120, sq=24):

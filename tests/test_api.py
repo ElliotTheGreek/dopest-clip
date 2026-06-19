@@ -109,6 +109,15 @@ def test_compose_and_mix_wrappers_delegate(monkeypatch):
     assert cap2["kwargs"]["overlays"] == [{"y": 2}]
 
 
+def test_replace_background_wrapper_delegates(monkeypatch):
+    cap = _spy(monkeypatch, cmx, "replace_background", {"ok": "bg"})
+    segs = [{"start": 0, "end": 8, "background": "camera"},
+            {"start": 8, "end": 20, "background": "C:/bg.png"}]
+    assert api.replace_background("p", "e", segs, max_duration=20) == {"ok": "bg"}
+    assert cap["args"][:3] == ("p", "e", segs)
+    assert cap["kwargs"]["max_duration"] == 20
+
+
 def test_get_cut_transcript_reads_text(monkeypatch, tmp_path):
     txt = tmp_path / "cut.txt"
     txt.write_text("hello cut transcript", encoding="utf-8")

@@ -129,6 +129,26 @@ the page scrolls, the face-ring auto-tracks the face, etc. The missing piece is 
 `reframe._OneEuro`, `reframe._load_model` + `reframe._detect_center` (YOLO), `timeline.sample_*`
 (static fallback), `grab_frame` (seed templates), `_prep_overlays`/`_paste_overlays_gpu` (compose).
 
+## BACKGROUND REPLACEMENT (cutout over an AI/any still image, per time window) (2026-06-18)
+Since we already hold the cutout matte, the recorded room can be swapped for a different
+background per time window — provider-agnostic: the op only composites; the background image is
+made by whatever image tool the user has (for us: Gemini to remove the person + modify the office).
+- NEW op `replace_background(project_id, edl_id, segments, output_path, max_duration)` in
+  camera_mix.py. `segments`=[{start,end,background}] cut-timeline secs; background = "camera" (real
+  room passthrough, no cutout) or a still-image path (cover-fit, cutout composited over it). Reuses
+  cached cut_cam + fgr/pha (needs mix_camera(remove_background=True) first); audio from cut screen;
+  GPU compose + NVENC (CPU fallback). Helpers `_cover_to` (cover-fit+centre-crop) + `_segment_at`
+  (pure, last-covering-segment-wins). Exposed in api (56 ops), GROUP recording, added to _RENDER_OPS
+  (async). Documented in mix_camera + learn://recording. 290 py pass, control 100%.
+- Background generation (external, our method): grab a camera frame (ffmpeg) → local image-tools
+  `gemini_edit_image` (Nano Banana gemini-2.5-flash-image; FlowDot Gemini HTTP toolkit also exists
+  but needs base64 INLINE which is impractical to hand-feed a 1080p frame from the agent — works
+  from a recipe/hosted-image). Made 3 demo1 office variants: bg_window.png / bg_shelves.png /
+  bg_evening.png (person removed, same room + window / bookshelves / night string-lights).
+- STATUS: code-complete + asset-ready, NOT yet rendered (needs restart). NEXT: start_render(
+  'replace_background', segments=[0-8 camera, 8-20 window, 20-32 shelves, 32-46 evening],
+  max_duration=46) → verify frames per segment.
+
 ### STATUS — IMPLEMENTED (2026-06-18, code-complete; live verify pending a server restart)
 1. **`dopest_clip/obs/tracking.py`** — DONE. `compute_track(video, target, every=, cache_path=)`
    → dense per-frame normalized `[{t,x,y,w,h}]`, smoothed via `reframe._smooth_centers` (reuses
@@ -162,8 +182,12 @@ the page scrolls, the face-ring auto-tracks the face, etc. The missing piece is 
    AROUND head = offset[0,0] scaled to head, badge to the side = offset[0.9,0]). Wired into
    composite_gpu (passes the per-frame cam rect into _paste_overlays_gpu) + vertical_clip (person
    rect) + CPU compositor (offset; camera src_rect GPU-path). Documented in mix_camera + learn.
-   286 py pass, control still 100%. NEXT: render demo1 lightbulb-over-head (face track, offset up)
-   at the "I had an idea" moment (~t11s) to prove it rides the head.
+   286 py pass, control still 100%. VERIFIED (2026-06-18, live via MCP): rendered demo1
+   demo_track_bulb.mp4 — camera as a 0.55 bottom-right PIP + a lightbulb overlay (captest1/
+   lightbulb.png, anchor bottom-centre, track {target:'face', source:'camera', offset:[0,-0.85]},
+   t_in 10/t_out 60). Frames t=14/48/56 confirm the bulb sits ABOVE the head and rides it on the
+   cutout in the corner as the head leans/moves (not stuck at screen-centre) — the camera-rect
+   mapping + offset both work. 200s, rvm-gpu/NVENC, matte_cached.
 
 > Earlier v2 polish (deferred, not parity): native file-picker, graphical keyframe-curve editor UI,
 > audio/image editor panels, FlowDot provider endpoint specifics.

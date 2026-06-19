@@ -300,6 +300,21 @@ def preview_track(project_id: str, target: str | dict, edl_id: str = "", source:
     return tracking.preview(video_path, target, at=at)
 
 
+def replace_background(project_id: str, edl_id: str, segments: list[dict], output_path: str = "",
+                       max_duration: float | None = None) -> dict:
+    """Re-background the talking head: composite the cached cutout over a DIFFERENT background per
+    time window. `segments` = [{start, end, background}] in CUT-timeline seconds; `background` is
+    "camera" (show the REAL recorded room — original frames, no cutout) or a path to a still IMAGE
+    the cutout is composited over (cover-fit). The image is made however you like — for us, the
+    Gemini image toolkit to remove the person and modify the office (add a window, etc.); this op is
+    provider-agnostic and only composites. Reuses the cached cut camera + RVM matte, so run
+    mix_camera(edl_id, remove_background=True) first. Audio from the cut screen. GPU+NVENC.
+    `max_duration` caps the render for a quick sample. Run via start_render for real lengths."""
+    from .obs import camera_mix
+    return camera_mix.replace_background(project_id, edl_id, segments,
+                                         output_path=output_path, max_duration=max_duration)
+
+
 def list_graphics() -> dict:
     """The built-in overlay graphic kinds and their params, for use in compose_camera
     `overlays`. You can also pass a custom inline `svg` or a pre-rendered transparent
@@ -323,7 +338,7 @@ def list_graphics() -> dict:
 
 
 # --- async render jobs (long renders run in the background; poll instead of blocking) ----
-_RENDER_OPS = {"mix_camera", "make_short", "render", "compose_camera", "verify_clip"}
+_RENDER_OPS = {"mix_camera", "make_short", "render", "compose_camera", "verify_clip", "replace_background"}
 
 
 def start_render(operation: str, params: dict | None = None) -> dict:
@@ -370,7 +385,7 @@ GROUPS: dict[str, list] = {
     "providers": [list_providers, set_provider, validate_provider],
     "recording": [list_devices, setup_scene, start_recording, stop_recording,
                   recording_status, compose_camera, mix_camera, get_cut_transcript,
-                  make_short, list_graphics, preview_track],
+                  make_short, list_graphics, preview_track, replace_background],
     "jobs": [start_render, render_status, list_render_jobs],
 }
 
